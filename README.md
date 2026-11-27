@@ -67,10 +67,10 @@ dsh plugin --profile web add github:xingzhen199186/dsh-everywhere
 
 #### 途径二：Release 里的 tgz
 
-从 [GitHub Releases](https://github.com/xingzhen199186/dsh-everywhere/releases/latest) 下载 `dsh-everywhere-0.3.1.tgz`，在「添加插件」中选择这个文件，或执行：
+从 [GitHub Releases](https://github.com/xingzhen199186/dsh-everywhere/releases/latest) 下载 `dsh-everywhere-0.1.0.tgz`，在「添加插件」中选择这个文件，或执行：
 
 ```powershell
-dsh plugin --profile web add C:\path\to\dsh-everywhere-0.3.1.tgz
+dsh plugin --profile web add C:\path\to\dsh-everywhere-0.1.0.tgz
 ```
 
 #### 途径三：本地目录
@@ -169,7 +169,9 @@ dsh plugin --profile web add C:\path\to\dsh-everywhere
 
 如果你不想每次都开浏览器，或者需要**锁屏也能收到审批、把别的 App 里的内容直接分享给 DSH、让电脑直接操作手机屏幕**，可以安装配套的 Android 应用 **DSH Everywhere**。
 
-手机 App 与插件现在统一叫 **DSH Everywhere**，不是两套产品：连接、会话和权限与网页版共用同一套，模型与文件仍然留在电脑。**应用标识沿用 `com.dsh.miniremote`，这是历史原因**；签名别名与 APK 文件名规则也不变，保证老用户可以覆盖升级。
+手机 App 与插件现在统一叫 **DSH Everywhere**，不是两套产品：连接、会话和权限与网页版共用同一套，模型与文件仍然留在电脑。**应用标识沿用 `com.dsh.miniremote`，这是历史原因**；签名别名与 APK 文件名规则也不变。
+
+插件与 App 的版本名都从 **0.1.0** 起算，Android `versionCode` 从 **1** 起算。**已装过旧开发包的用户需要先卸载再安装**，否则系统会认为新包版本更低并拒绝安装；卸载会清除 App 本地设置，需要重新配对。
 
 > **使用 App 前，请先在电脑上安装并启动 `dsh-everywhere` 插件 0.3.0 或以上版本。** 更早的插件没有 App 需要的配对、地址池和更新接口。
 

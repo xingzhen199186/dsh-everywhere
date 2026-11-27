@@ -2136,11 +2136,24 @@ test('frpc 按需下载：哈希钉死、只在需要时取（2026-11-27）', as
   assert.match(src, /export const FRPC_SHA256 = '[0-9a-f]{64}'/, 'sha256 必须是完整 64 位')
   assert.match(src, /if \(got !== FRPC_SHA256\)/, '下载后必须核对')
   assert.match(src, /xingzhen199186\/dsh-everywhere\/releases\/download/, '从项目自己的发布页取')
-  assert.match(src, /FRPC_RELEASE_TAG = 'v0\.3\.1'/, '附件随插件 v0.3.1 发布，不把 frp 本体版本当成 Release 标签')
-  assert.match(src, /download\/\$\{FRPC_RELEASE_TAG\}/, '下载地址必须使用插件 Release 标签')
+  assert.match(src, /FRPC_RELEASE_TAG = `frps-\$\{FRPC_VERSION\}`/, '固定 tag 只跟 frp 版本走，不随插件版本变化')
+  assert.match(src, /download\/\$\{FRPC_RELEASE_TAG\}/, '下载地址必须使用独立固定 Release 标签')
 
   const relay = readFileSync(new URL('../lib/self-relay.js', import.meta.url), 'utf8')
   assert.match(relay, /ensureFrpc\(\{ dataDir, log \}\)/, '自建中继启动前要自动取回')
   // 已有本地文件时不该再下载
   assert.match(src, /if \(existsSync\(target\) && statSync\(target\)\.size > 1024 \* 1024\) return target/)
+})
+
+test('frpc 下载地址：固定使用 frps-0.71.1，绝不混入插件版本号（2026-11-27）', async () => {
+  const { frpcDownloadSources, FRPC_VERSION } = await import('../lib/frpc-download.js')
+  const { readFileSync } = await import('node:fs')
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
+  const urls = frpcDownloadSources()
+  assert.ok(urls.length >= 2, '官方地址之外还要有镜像兜底')
+  for (const url of urls) {
+    assert.ok(url.includes(`/releases/download/frps-${FRPC_VERSION}/`), url)
+    assert.equal(url.includes(`/releases/download/v${FRPC_VERSION}/`), false, `不能把 frp 本体版本当成插件 tag：${url}`)
+    assert.equal(url.includes(`/releases/download/v${pkg.version}/`), false, `不能混入插件版本号：${url}`)
+  }
 })

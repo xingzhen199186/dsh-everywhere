@@ -2,6 +2,21 @@
 
 本文件记录每个版本改了什么。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.1.0] - 2026-11-27
+
+<!-- 2026-11-27：项目重起炉灶，版本重新起算；附录只保存旧项目历史，不作为本版本的变更清单。 -->
+
+### 新项目的第一个版本
+
+- 插件与 Android App 统一使用 **DSH Everywhere** 名称，插件包名改为 `dsh-everywhere`，插件数据目录同步改名。
+- npm tgz 不含可执行文件；cloudflared 与 frpc 按需下载，frpc 使用独立固定 Release 并校验 SHA-256。
+- 保留 Android `applicationId`、签名别名与 APK 命名兼容性；插件与 App 版本名从 0.1.0 起算，Android `versionCode` 从 1 起算。
+- 从旧插件迁移时不继承旧数据目录中的配置，用户需要重新配对并核对设置。
+
+## 附录：旧项目 dsh-mini-remote 的历史
+
+以下 0.1.0–0.3.1 内容仅用于查询旧项目历史，不属于新项目的版本序列。
+
 ## [0.3.1] - 2026-11-18
 
 ### 新加的

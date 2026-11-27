@@ -122,11 +122,13 @@ keyPassword=……
 
   证书 SHA-256 应该是 `79:19:DB:26:…`（正式密钥），出现 `CN=Android Debug` 就是没生效。
 
-打包开发版时版本号怎么给（当前开发 0.1.1，只递增 `versionCode`）：
+打包开发版时版本号怎么给（新项目从 0.1.0 / 1 起算）：
 
 ```bat
-gradlew.bat assembleBridgeDebug -PappVersionName=0.1.1 -PappVersionCode=17
+gradlew.bat assembleBridgeDebug -PappVersionName=0.1.0 -PappVersionCode=1
 ```
+
+2026-11-27 起 `versionCode` 重新从 1 起算。**已装过旧开发包的用户必须先卸载再安装**，否则 Android 会因为新包的版本号更低而拒绝安装。
 
 ## 明文 HTTP 的边界
 

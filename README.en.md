@@ -67,10 +67,10 @@ dsh plugin --profile web add github:xingzhen199186/dsh-everywhere
 
 #### Option 2: Release tgz
 
-Download `dsh-everywhere-0.3.1.tgz` from [GitHub Releases](https://github.com/xingzhen199186/dsh-everywhere/releases/latest), then select it in **Add Plugin** or run:
+Download `dsh-everywhere-0.1.0.tgz` from [GitHub Releases](https://github.com/xingzhen199186/dsh-everywhere/releases/latest), then select it in **Add Plugin** or run:
 
 ```powershell
-dsh plugin --profile web add C:\path\to\dsh-everywhere-0.3.1.tgz
+dsh plugin --profile web add C:\path\to\dsh-everywhere-0.1.0.tgz
 ```
 
 #### Option 3: Local directory
@@ -169,7 +169,9 @@ Open this computer's complete DSH interface directly inside another computer's D
 
 If you would rather not open a browser every time, or you need **approvals on the lock screen, system sharing from other apps into DSH, or the computer to operate the phone screen directly**, install the Android companion app **DSH Everywhere**.
 
-The Android app and the plugin now share the name **DSH Everywhere**. They are not separate products: connections, sessions, and permissions are shared with the web page, while the model and files stay on the computer. **The application ID remains `com.dsh.miniremote` for historical compatibility**; the signing alias and APK naming rules are unchanged so existing users can update in place.
+The Android app and the plugin now share the name **DSH Everywhere**. They are not separate products: connections, sessions, and permissions are shared with the web page, while the model and files stay on the computer. **The application ID remains `com.dsh.miniremote` for historical compatibility**; the signing alias and APK naming rules are unchanged.
+
+Both the plugin and the Android app start at version **0.1.0**, and Android `versionCode` starts at **1**. **Users who installed an older development build must uninstall it first**, because Android rejects the new build as a downgrade. This clears the app's local settings and requires pairing again.
 
 > **Before using the app, install and start `dsh-everywhere` 0.3.0 or newer on the computer.** Earlier plugin versions do not provide the pairing, address-pool, and update interfaces the app needs.
 
