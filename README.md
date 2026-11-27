@@ -33,6 +33,10 @@
 
 ## 这是什么
 
+> **前身说明（主动披露）**：本项目原名 `dsh-mini-remote`。旧包 0.3.0 于 2026-11-18 被 npm 发布扫描判为恶意包，账号被暂停，工单 5021460。
+> 本包是整改后的重建版本：**包内不含任何可执行文件**（`frpc` 改为运行时从 GitHub Release 下载并按固定 SHA-256 校验）、按《双用途内容政策》声明 `contentPolicy: dual-use`、根目录附 `DISCLOSURE` 逐条说明能力与授权方式。
+> 整改详情见 [CHANGELOG 附录](CHANGELOG.md) 与本仓库提交历史。
+
 DSH Everywhere 是一个运行在 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/DeepSeek-Harness) 里的插件。手机 App 与电脑插件现在使用同一个名字，主要解决三件事：
 
 - **手机遥控**：在手机浏览器里切换「单帧」、「聊天」和「完整」模式查看会话、发送指令、回答问题或处理审批，不必把整个桌面界面挤进小屏。
