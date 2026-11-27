@@ -1,7 +1,7 @@
 {
   "name": "dsh-everywhere",
   "version": "0.1.0",
-  "description": "适应多种使用场景，将注意力支配权交还给用户。移动端提供「单帧」、「聊天」和「完整」三种模式，用户可以选择彻底屏蔽执行噪声，也可随时展开完整轨迹；PC 端提供远程窗口功能，可在多台设备上以桌面端原生 UI 界面操作核心设备上的 DeepSeek Harness。",
+  "description": "将dsh能力从核心PC设备延伸到移动端、其他电脑等多场景，并匹配远程操控、跨机协作等功能。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
