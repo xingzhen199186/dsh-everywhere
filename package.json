@@ -31,7 +31,8 @@
     "test": "node --test \"test/*.test.mjs\"",
     "check:adb": "node scripts/adb-channel-check.mjs",
     "guard:keys": "node scripts/check-staged-keys.mjs --all",
-    "prepare": "node scripts/install-git-hooks.mjs || exit 0"
+    "prepare": "node scripts/install-git-hooks.mjs || exit 0",
+    "build:deps": "node scripts/fetch-build-deps.mjs"
   },
   "engines": {
     "node": "^22.19.0 || >=24.0.0",

@@ -1,5 +1,13 @@
 # 安卓客户端（源码目录）
 
+> **编之前先做一步**（2026-11-27 起）：`node scripts/fetch-build-deps.mjs`
+>
+> 编 APK 需要 `appctr.aar`（8.6 MB）与 `libtailscale.so`（28.1 MB）。它们体积大、来源在仓库外，
+> 所以**不入库**：清单在 `build-deps.json`（名字、大小、sha256、来源），文件挂在
+> [build-deps](https://github.com/xingzhen199186/dsh-everywhere/releases/tag/build-deps) 这个固定 Release 下。
+> 脚本会下到正确位置并核对哈希；加 `--check` 只看不下载。
+
+
 这里是 `dsh-everywhere` 的安卓客户端源码。**只放客户端，不放插件**；插件本体在仓库根目录的 `lib/`、`client/`。
 
 2026-11-27 起 App 与插件统一叫 DSH Everywhere，但 `namespace` / `applicationId` 仍沿用 `com.dsh.miniremote`，签名别名仍沿用 `dsh-mini-remote`。这是历史兼容要求：改了它们，老用户就无法覆盖更新。

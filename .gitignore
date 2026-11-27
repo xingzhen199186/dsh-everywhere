@@ -138,3 +138,8 @@ keys/
 
 # 打包产物：npm pack 生成的安装包不入仓
 *.tgz
+
+# 编 APK 或发版要用、但不入库的二进制（2026-11-27）
+# 清单见 build-deps.json，取件用 scripts/fetch-build-deps.mjs
+#   appctr.aar 与 libtailscale.so 原本就有规则，这里补齐 frpc
+tools/frpc.exe

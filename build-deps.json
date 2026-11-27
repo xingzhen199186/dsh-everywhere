@@ -1,0 +1,30 @@
+{
+  "说明": "编译或发版要用、但不入库的二进制。仓库只存这份清单；文件挂在 Releases 的固定 tag build-deps 下，用 scripts/fetch-build-deps.mjs 取回并核对哈希。",
+  "release": "https://github.com/xingzhen199186/dsh-everywhere/releases/download/build-deps",
+  "files": [
+    {
+      "name": "appctr.aar",
+      "path": "android/app/libs/appctr.aar",
+      "bytes": 8970883,
+      "sha256": "ce34e8f66f6dab23104a821dd9945b557df6fb6001370cce5b922b6338d7c51e",
+      "why": "内置 Tailscale 的 Java/Go 封装库（TailSocks appctr），编 APK 时需要",
+      "origin": "外部提供：TailSocks appctr 打出的 AAR；分发前需核对来源与许可证"
+    },
+    {
+      "name": "libtailscale.so",
+      "path": "android/app/src/main/jniLibs/arm64-v8a/libtailscale.so",
+      "bytes": 29471928,
+      "sha256": "99e173dd5da8cf4f164c68899bb420198a768f3108355c3746044d98fd974284",
+      "why": "Tailscale 守护进程（Go 交叉编译产物），编 APK 时打进 jniLibs",
+      "origin": "由 Tailscale 的 Go 代码交叉编译得到；理论上可自行生成，暂无脚本"
+    },
+    {
+      "name": "frpc.exe",
+      "path": "tools/frpc.exe",
+      "bytes": 17043968,
+      "sha256": "23d11640bee87207c7a99d006b84c554df997feeba7ac7243db20a88a9cb5e01",
+      "why": "FRP 客户端；自建中继的用户首次使用时由插件自动下载，发版时随 Release 提供",
+      "origin": "github.com/fatedier/frp v0.71.1 windows_amd64（Apache-2.0）"
+    }
+  ]
+}
