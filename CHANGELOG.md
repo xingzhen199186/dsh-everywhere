@@ -10,7 +10,7 @@
 
 - 插件与 Android App 统一使用 **DSH Everywhere** 名称，插件包名改为 `dsh-everywhere`，插件数据目录同步改名。
 - npm tgz 不含可执行文件；cloudflared 与 frpc 按需下载，frpc 使用独立固定 Release 并校验 SHA-256。
-- 保留 Android `applicationId`、签名别名与 APK 命名兼容性；插件与 App 版本名从 0.1.0 起算，Android `versionCode` 从 **11** 起算（旧对外包是 10，写 1 会被系统判为降级）。
+- 保留 Android `applicationId`、签名别名与 APK 命名兼容性；插件与 App 版本名从 0.1.0 起算，Android `versionCode` 从 **18** 起算（真机旧开发包已到 17，写更小会被判为降级）。
 - 从旧插件迁移时不继承旧数据目录中的配置，用户需要重新配对并核对设置。
 
 ## 附录：旧项目 dsh-mini-remote 的历史

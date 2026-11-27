@@ -171,7 +171,7 @@ If you would rather not open a browser every time, or you need **approvals on th
 
 The Android app and the plugin now share the name **DSH Everywhere**. They are not separate products: connections, sessions, and permissions are shared with the web page, while the model and files stay on the computer. **The application ID remains `com.dsh.miniremote` for historical compatibility**; the signing alias and APK naming rules are unchanged.
 
-Both the plugin and the Android app start at version **0.1.0**. Android `versionCode` starts at **11**, because the previous published build already used 10 — a lower number would be rejected as a downgrade. Existing installs can be updated in place.
+Both the plugin and the Android app start at version **0.1.0**. Android `versionCode` starts at **18**, because development builds on test devices already reached 17 — a lower number would be rejected as a downgrade. Existing installs can be updated in place.
 
 > **Before using the app, install and start `dsh-everywhere` 0.3.0 or newer on the computer.** Earlier plugin versions do not provide the pairing, address-pool, and update interfaces the app needs.
 
