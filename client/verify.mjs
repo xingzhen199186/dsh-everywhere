@@ -1,0 +1,3695 @@
+// client/verify.mjs —— 手工验证 client/client.js 是否真的能用（零依赖、不需要测试框架）。
+//
+// 用法：node client/verify.mjs
+//
+// 做四件事：
+//   1. 伪造 window.__ModuleLoader__，把整个文件 eval 一遍，确认模块外壳被注册；
+//   2. 用 React 替身调用 factory，检查 exports（name / inject / apply）；
+//   3. 用假的 ctx 调 apply，检查三个槽位的注册形状与组件：
+//      main（keyed，key 对上面板）、sidebar.panellist（list，id/order/label + 图标）、
+//      settings.section（设置页那一节）；
+//   4. 用替身 React 真渲染一遍组件：加载中 → ok:false → ok:true → 网络错误，
+//      并点一次「复制」按钮，确认文案临时变成「已复制」。
+
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const source = readFileSync(join(here, 'client.js'), 'utf8');
+
+// ---------------------------------------------------------------- 小工具
+
+const tick = () => new Promise((resolve) => setImmediate(resolve));
+
+/**
+ * 造一个「本地时刻」：`localMs(16, 15, 8)` = 2026-10-16 15:08，**按本机时区算**。
+ *
+ * ## 为什么不用 `new Date('2026-10-16T15:08:00+08:00')`
+ *
+ * 那是**绝对时刻**，而 `formatTime`（client.js）是按**运行环境的本地时区**显示的：
+ * 本机在 UTC+8 上两者碰巧一致；CI 跑在 UTC 上就差 8 小时，显示成 07:08。
+ *
+ * 2026-10-17 CI 首跑就是为这个红了三条（"最近成功 15:08"、"创建于 06:20"、"最近成功 07:08"）。
+ * **本机永远发现不了** —— 这正是加 CI 的意义。用本地构造之后，任何时区下显示出来都是同一串。
+ */
+const localMs = (day, hour, minute) => new Date(2026, 9, day, hour, minute, 0, 0).getTime();
+
+/**
+ * 把一条「点击 → 发请求 → 回执 → 存状态 → 通知 → 重画」的链子走完。
+ *
+ * 这条链子全是微任务（`setImmediate` 之前微任务已经排干），一次 tick 通常就够；
+ * 多走几步是为了让断言别看到**上一轮**的结果（那是"差一条"的经典成因）。
+ */
+const settlePanel = async () => { for (let i = 0; i < 6; i += 1) await tick(); };
+
+const setGlobal = (name, value) =>
+  Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
+
+/** 把渲染树摊平成纯文本，用来断言界面上出现了哪些字。 */
+function textOf(node) {
+  if (node === null || node === undefined || typeof node === 'boolean') return '';
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(textOf).join(' ');
+  return textOf(node.children);
+}
+
+/** 收集渲染树里所有元素节点（深度优先）。 */
+function walk(node, out = []) {
+  if (node === null || node === undefined || typeof node !== 'object') return out;
+  if (Array.isArray(node)) {
+    for (const child of node) walk(child, out);
+    return out;
+  }
+  out.push(node);
+  walk(node.children, out);
+  return out;
+}
+
+const byType = (tree, type) => walk(tree).filter((node) => node.type === type);
+
+/** 展开设置页的一个分组；已经展开时什么都不做。所有分组用例共用这一个动作。 */
+const expandSettingsGroup = async (tree, key) => {
+  const group = walk(tree).find((n) => n && n.props && n.props.key === 'group-' + key);
+  assert.ok(group, `设置页应有分组 group-${key}`);
+  const button = byType(group, 'button').find((b) => textOf(b) === '展开');
+  if (button) {
+    button.props.onClick();
+    await tick();
+  }
+};
+
+/** 展开连接与固定地址内部的全部小分类。传入 getTree，确保每次点击后拿到最新树。 */
+const expandExternalSubs = async (getTree) => {
+  const titles = ['Tailscale 提示', '公网访问', '手动公网地址', '专属固定地址', '自建中继（单用户）', '自建多用户中继', 'Tailscale HTTPS'];
+  for (const title of titles) {
+    const tree = getTree();
+    const group = walk(tree).find((n) => n && n.props && n.props.key === 'group-external');
+    if (!group) continue;
+    const button = byType(group, 'button').find((b) => textOf(b) === '展开：' + title);
+    if (button) {
+      button.props.onClick();
+      await tick();
+    }
+  }
+};
+
+const collapseSettingsGroup = async (tree, key) => {
+  const group = walk(tree).find((n) => n && n.props && n.props.key === 'group-' + key);
+  assert.ok(group, `设置页应有分组 group-${key}`);
+  const button = byType(group, 'button').find((b) => textOf(b) === '收起');
+  if (button) {
+    button.props.onClick();
+    await tick();
+  }
+};
+
+/**
+ * 最小 React 替身 + 最小渲染循环。
+ * createElement 返回普通对象；useState 真的能改状态并触发重渲染；
+ * useEffect 不在渲染时执行，由 runEffects() 显式跑一次（和 React 一致）。
+ */
+function createHarness() {
+  const cells = [];
+  let cursor = 0;
+  let pending = [];
+  let cleanups = [];
+  let onUpdate = null;
+
+  const React = {
+    createElement(type, props, ...children) {
+      return { type, props: props || {}, children };
+    },
+    useState(initial) {
+      const i = cursor++;
+      if (i >= cells.length) cells.push(typeof initial === 'function' ? initial() : initial);
+      const set = (next) => {
+        cells[i] = typeof next === 'function' ? next(cells[i]) : next;
+        if (onUpdate) onUpdate();
+      };
+      return [cells[i], set];
+    },
+    useEffect(fn) { pending.push(fn); },
+    /**
+     * **跨渲染得是同一个对象**（React 的 useRef 就是这样的把手）。
+     *
+     * 这里原来是 `return { current: initial }`——每次渲染给一个新的。平时看不出来，
+     * 但只要有人把"下一次要用的东西"存在 ref 里，就会静默失效：立钟的那一次渲染和
+     * 清钟的那一次渲染手里拿的不是同一个盒子（2026-10-17 那一处 20 秒兜底就是这么撞上的）。
+     * 和 useState 用同一个 cursor：hook 的顺序口径两边一致。
+     */
+    useRef(initial) {
+      const i = cursor++;
+      if (i >= cells.length) cells.push({ current: initial });
+      return cells[i];
+    },
+  };
+
+  return {
+    React,
+    /**
+     * 渲染一次；重渲染会丢掉上一次登记的 effect（等价于依赖数组没变时不重跑）。
+     *
+     * `props` 是外壳递进来的那些（真机上设置页那一节会拿到 `{ close }`，见
+     * dsh-client-ui-settings-general 的 `renderSlot("settings.section", { close })`）。
+     */
+    draw(Comp, props) { cursor = 0; pending = []; return Comp(props || {}); },
+    runEffects() {
+      const fns = pending;
+      pending = [];
+      for (const fn of fns) {
+        const dispose = fn();
+        if (typeof dispose === 'function') cleanups.push(dispose);
+      }
+    },
+    unmount() { for (const dispose of cleanups) dispose(); cleanups = []; },
+    onUpdate(fn) { onUpdate = fn; },
+  };
+}
+
+/**
+ * 组件在 factory 里就把 React.useState/useEffect 绑进了工厂闭包，所以替身必须是
+ * 一个稳定的门面对象，内部转发给「当前这一套状态」——否则第二套 harness 永远不生效。
+ */
+let active = null;
+const ReactFacade = {
+  createElement: (type, props, ...children) => active.React.createElement(type, props, ...children),
+  useState: (initial) => active.React.useState(initial),
+  useEffect: (fn) => active.React.useEffect(fn),
+  useRef: (initial) => active.React.useRef(initial),
+};
+
+/** 新建一套状态单元并设为当前（每个渲染用例一套，互不干扰）。 */
+function useHarness() {
+  active = createHarness();
+  return active;
+}
+
+/** 假的 fetch 响应。 */
+const jsonResponse = (status, body) => ({
+  status,
+  json: async () => body,
+});
+
+// ---------------------------------------------------------------- 断言运行器
+
+let passed = 0;
+const failures = [];
+
+async function check(label, fn) {
+  try {
+    // 2026-10-19：**每条用例开始前把「远程窗口」那一趟清干净**。
+    //
+    // 那些状态（`remoteTarget` / `remoteWin` / `remoteBusyId` / `remoteProblems`）是
+    // **模块级**的，会跨用例、跨测试块留下。保活之后「返回列表」不再清 `remoteWin`，
+    // 于是上一个用例的票会让本用例的取票根本不发生——一眼假红，而且是随机红。
+    //
+    // 清在这里而不是各个 `fresh()` 里：`fresh()` 只覆盖了某一个测试块，清在运行器里
+    // 才覆盖得上全部（第一个用例时 `mod` 还没造出来，跳过即可）。
+    if (mod && typeof mod.resetRemoteSession === 'function') mod.resetRemoteSession();
+    await fn();
+    passed += 1;
+    console.log(`  ✓ ${label}`);
+  } catch (err) {
+    failures.push({ label, err });
+    console.log(`  ✗ ${label}`);
+    console.log(`      ${err && err.message ? err.message : err}`);
+  }
+}
+
+// ---------------------------------------------------------------- 1. 模块外壳
+
+let captured = null;
+setGlobal('window', {
+  __ModuleLoader__: { load: (registration) => { captured = registration; } },
+  // 「顶上那条横条要不要自动收起」靠这一条判断（见 client.js 的 HAS_HOVER）。
+  // 这里给真的 `matches: true`：**桌面端就是精细指针**，收起那条路才是线上真实行为。
+  // 少了它，`HAS_HOVER` 会走 catch 变成 false，横条永远常驻——那等于把要验的东西跳过去了。
+  matchMedia: (query) => ({ matches: /hover/.test(String(query)), media: String(query) }),
+});
+(0, eval)(source); // 间接 eval：在全局作用域执行，模拟浏览器加载这个脚本
+
+console.log('\n[1] 模块外壳 window.__ModuleLoader__.load');
+
+await check('文件执行后捕获到一次注册', () => {
+  assert.ok(captured, '没有调用 window.__ModuleLoader__.load');
+});
+await check('id === "dsh-everywhere"', () => {
+  assert.equal(captured.id, 'dsh-everywhere');
+});
+await check('factory 是函数', () => {
+  assert.equal(typeof captured.factory, 'function');
+});
+
+// ---------------------------------------------------------------- 2. factory / exports
+
+const harness = useHarness();
+const required = [];
+const fakeRequire = (spec) => {
+  required.push(spec);
+  if (spec === 'react') return ReactFacade;
+  throw new Error(`客户端模块只允许 require("react")，实际请求了 "${spec}"`);
+};
+
+// `var` 而不是 `let`：`check()`（在它之前定义）里要读它做「每条用例前清场」。
+// `let` 在 TDZ 里，`check` 早于这一行执行时连 `typeof` 都会抛 ReferenceError。
+var mod = null;
+console.log('\n[2] factory(require) 的返回值');
+await check('factory 不抛错并返回 exports', () => {
+  mod = captured.factory(fakeRequire);
+  assert.ok(mod && typeof mod === 'object');
+});
+await check('只 require 了 react（零运行时依赖）', () => {
+  assert.deepEqual(required, ['react']);
+});
+await check('exports.name === "dsh-everywhere"', () => {
+  assert.equal(mod.name, 'dsh-everywhere');
+});
+await check("exports.inject 深等于 ['slots']", () => {
+  assert.deepEqual(mod.inject, ['slots']);
+});
+await check('exports.apply 是函数', () => {
+  assert.equal(typeof mod.apply, 'function');
+});
+
+// ---------------------------------------------------------------- 3. apply / slots 注册
+
+const injected = [];
+const registered = [];
+const fakeCtx = {
+  slots: {
+    inject(name, callback) { injected.push(name); return callback(); },
+    register(def, Comp) { registered.push({ def, Comp }); return () => {}; },
+  },
+};
+
+let Comp = null;
+/** 按槽位名取注册的那一条；找不到就是漏注册了，让断言去报错。 */
+const entryOf = (name) => registered.find(({ def }) => def.name === name) || { def: {}, Comp: undefined };
+console.log('\n[3] apply(ctx) 的 slots 注册');
+await check('apply(fakeCtx) 不抛错', () => {
+  assert.doesNotThrow(() => mod.apply(fakeCtx));
+});
+await check('三个槽位都走 inject（等声明出现再注册）：main / sidebar.panellist / settings.section', () => {
+  assert.deepEqual(injected, ['main', 'sidebar.panellist', 'settings.section']);
+});
+await check('register 一共调用了三次（图标一枚 + 面板一屏 + 设置页一节）', () => {
+  assert.equal(registered.length, 3);
+});
+
+// —— main：keyed 槽。注册的键写在 `key` 上，不是 id。
+await check('main 那条：def.name === "main"', () => {
+  assert.equal(entryOf('main').def.name, 'main');
+});
+await check('main 那条：def.key === "mini-remote"（keyed 槽认的是 key）', () => {
+  assert.equal(entryOf('main').def.key, 'mini-remote');
+});
+await check('main 那条：不写 keyed 槽用不到的 id', () => {
+  assert.equal(entryOf('main').def.id, undefined);
+});
+await check('main 那条：第二个参数是面板组件函数', () => {
+  assert.equal(typeof entryOf('main').Comp, 'function');
+});
+
+// —— main 那条面板（2026-10-17 改过）：**侧栏图标点开先看到一份「其他电脑」名单**。
+//     点某一台，才去换**那一台**的票、把它的界面嵌进来。
+//
+//     原来点开这一屏显示的是**本机**的电脑端界面——那是跨机还没做出来时的脚手架。
+//     下面第一、二条就是它「从界面上退休」的凭据：面板挂载只读名单，**一次本机取票都不许有**，
+//     源码里也不许再出现那条地址。宿主侧那条路由一个字没动（见 lib/index.js）。
+const REMOTE_TICKET_URL = 'http://192.168.1.9:19387/mini/mirror/?ticket=one-shot-remote-value';
+const PANEL_FAR = {
+  id: 'f'.repeat(32), name: '书房那台', baseUrl: 'http://192.168.1.9:19387',
+  lastOk: localMs(16, 15, 8),
+};
+const PANEL_OLD = { id: 'e'.repeat(32), name: '', baseUrl: 'http://100.92.105.99:19387', lastOk: 0 };
+const Panel = entryOf('main').Comp;
+
+/**
+ * 挂一次「那一整屏」：`reply({ url, init, n })` 给响应，`box.asks` 是这一趟发出去的全部请求。
+ * 返回的 `box` 里那棵树会跟着重画走（重画之后读 `box.tree` 才是新的）。
+ */
+const mountPanel = async (reply) => {
+  const hh = useHarness();
+  const box = { asks: [], tree: null, harness: hh };
+  setGlobal('fetch', (url, init) => {
+    box.asks.push({ url, method: (init && init.method) || 'GET', body: init && init.body });
+    return Promise.resolve(reply({ url, init, n: box.asks.length }));
+  });
+  hh.onUpdate(() => { box.tree = hh.draw(Panel); });
+  box.tree = hh.draw(Panel);
+  hh.runEffects();
+  await settlePanel();
+  return box;
+};
+/** 名单来一份的两条路：读到了（有/没有内容）和读不到。 */
+const remotesOk = (remotes) => () => jsonResponse(200, { ok: true, remotes: remotes });
+const panelRow = (box, id) => walk(box.tree).find((n) => n && n.props && n.props.key === id);
+
+await check('点开先读「其他电脑」名单：GET /mini-remote/remotes（**不再去换本机那张票**）', async () => {
+  // ⚠️ **反向验证的靶子**：把「打开名单」改回「显示本机」（面板挂载时 POST 那条本机取票），
+  //    这一条必须变红——它就是"看本机那条路退休了没有"的看门人。
+  const box = await mountPanel(remotesOk([PANEL_FAR]));
+  assert.deepEqual(box.asks.map((a) => a.method + ' ' + a.url), ['GET /mini-remote/remotes'],
+    '面板点开那一刻，发出去的**只能**是读名单那一条');
+  assert.equal(box.asks.filter((a) => a.method === 'POST').length, 0,
+    '**看本机那条路退休了**：面板点开不再换本机那张票（POST 一次都不该有）');
+  box.harness.unmount();
+});
+
+await check('看本机那条取票路确实退休：client.js 里不再出现那条地址', () => {
+  assert.doesNotMatch(source, /\/mini-remote\/window/,
+    '界面上不再走本机取票那条路（宿主侧那条路由还留着，不在这个文件里——见 lib/index.js）');
+});
+
+await check('名单到了：一行一台，名字 + 地址 + 最近一次成功的时间', async () => {
+  const box = await mountPanel(remotesOk([PANEL_FAR, PANEL_OLD]));
+  const text = textOf(box.tree);
+  assert.match(text, /书房那台/);
+  assert.match(text, /http:\/\/192\.168\.1\.9:19387/, '地址要摆出来（用户拿它和对面核对）');
+  assert.match(text, /最近成功 2026-10-16 15:08/, '要说清"最近一次成功"是哪一刻');
+  assert.match(text, /最近成功 还没有记录/, '没成功过就说还没有记录，不编一个时间');
+  assert.match(text, /（这台电脑没有名字）/, '名字空着（用地址当名字时也可能为空）也要有个说法');
+  assert.doesNotMatch(text, /NaN|undefined|Invalid Date/);
+  assert.equal(byType(box.tree, 'iframe').length, 0, '还没点哪一台，一个框都不许立');
+  box.harness.unmount();
+});
+
+await check('一台也没连过：那句人话（去设置里加一台）+ 一个「重新读一遍」', async () => {
+  const box = await mountPanel(remotesOk([]));
+  const text = textOf(box.tree);
+  assert.match(text, /还没连过别的电脑/);
+  assert.match(text, /设置 → 遥控设置 → 其他电脑/);
+  assert.ok(byType(box.tree, 'button').some((b) => textOf(b) === '重新读一遍'),
+    '要给人一个"再看一眼"的入口（他可能刚在设置页里加完）');
+  assert.equal(byType(box.tree, 'iframe').length, 0);
+  box.harness.unmount();
+});
+
+await check('名单读不到：照登原因（接口都没有 = 重启），**不说成"还没连过"**', async () => {
+  const box = await mountPanel(() => jsonResponse(404, { ok: false, error: 'not found' }));
+  const text = textOf(box.tree);
+  assert.match(text, /读「其他电脑」名单失败/);
+  assert.match(text, /重启一次 DSH 再试/, '接口都没有（宿主是旧版）时，下一步只有一句话：重启');
+  assert.doesNotMatch(text, /还没连过别的电脑/, '读不到 ≠ 一台都没有（说错了会让人去重配一台好着的）');
+  box.harness.unmount();
+});
+
+await check('点某一台 → 换**那一台**的票，框的地址里只有票、没有令牌', async () => {
+  const box = await mountPanel(({ url }) => (url === '/mini-remote/remotes'
+    ? jsonResponse(200, { ok: true, remotes: [PANEL_FAR] })
+    : jsonResponse(200, { ok: true, url: REMOTE_TICKET_URL, expiresIn: 30 })));
+  const row = panelRow(box, PANEL_FAR.id);
+  assert.ok(row, '名单上要有那一行');
+  row.props.onClick();
+  await settlePanel();
+  const post = box.asks.filter((a) => a.method === 'POST');
+  assert.equal(post.length, 1, '点一行 = 去换那一台的票');
+  assert.equal(post[0].url, '/mini-remote/remotes/window');
+  assert.deepEqual(JSON.parse(post[0].body), { id: PANEL_FAR.id });
+  const iframe = byType(box.tree, 'iframe')[0];
+  assert.ok(iframe, '票到手了就把那一台的框立起来');
+  assert.equal(iframe.props.src, REMOTE_TICKET_URL);
+  assert.match(iframe.props.src, /\?ticket=/, '进门的凭据只能是那张票');
+  assert.doesNotMatch(iframe.props.src, /[?&]token=/,
+    '框的地址里**不许出现令牌**——那会留在打开这台电脑的人的浏览历史里');
+  // 看完这一台，从界面**回到名单**：顶上那枚按钮，而且人还在这一屏里（不退出面板）。
+  const back = byType(box.tree, 'button').find((b) => textOf(b) === '← 返回列表');
+  assert.ok(back, '界面顶上要有一条回名单的路');
+  back.props.onClick();
+  box.harness.runEffects();   // 回到名单那一层：名单的 effect 重新读一遍
+  await settlePanel();
+  // 2026-10-19 **保活**：回到名单时那一屏**不再卸载**，只是藏起来（切回来秒开，
+  // 不走一遍「取票 + 重新加载」）。所以这里断言的是"还在"，不再是"没了"。
+  // 真正会卸载它的只有「退出这一屏」（`resetRemoteSession`）。
+  assert.equal(byType(box.tree, 'iframe').length, 1,
+    '保活：那一屏留在 DOM 里（切回来不用重新加载），只是藏在名单后面');
+  assert.ok(panelRow(box, PANEL_FAR.id), '名单又回来了（这一屏没离开）');
+  box.harness.unmount();
+});
+
+await check('**出错那几种状态下**也回得去：那句人话旁边就是「← 返回列表」', async () => {
+  const box = await mountPanel(({ url }) => (url === '/mini-remote/remotes'
+    ? jsonResponse(200, { ok: true, remotes: [PANEL_FAR] })
+    : jsonResponse(502, { ok: false, error: '那台电脑已经不认这枚凭据了——多半是它那边把这条记录撤销了。' })));
+  panelRow(box, PANEL_FAR.id).props.onClick();
+  await settlePanel();
+  const text = textOf(box.tree);
+  assert.match(text, /这台电脑已经被对方撤销了，要重新配对/, '出错了要给人话（上一轮做好的那一条）');
+  assert.match(text, /再试一次/, '还要给一个下一步');
+  assert.equal(byType(box.tree, 'iframe').length, 0, '没换到票就别立框');
+  const back = byType(box.tree, 'button').find((b) => textOf(b) === '← 返回列表');
+  assert.ok(back, '出错的时候最需要的恰恰是"怎么回去"——这一条不能只在成功时才有');
+  back.props.onClick();
+  box.harness.runEffects();
+  await settlePanel();
+  assert.equal(byType(box.tree, 'iframe').length, 0);
+  assert.ok(panelRow(box, PANEL_FAR.id), '退回名单，人没卡在那一屏里');
+  box.harness.unmount();
+});
+
+// —— 那一屏的 20 秒兜底（2026-10-17 修）：**框加载成功之后，那个钟必须被掐掉**。
+//
+// 下面两条是一对：前一条管"加载好了就不许再吓人"，后一条管"真的没打开照样要说人话"。
+// 两条合起来才是这个兜底该有的样子——只测前一条的话，把兜底整个删掉也能变绿。
+//
+// 这里把 `setTimeout` / `clearTimeout` 换成能手动点的：**清掉 = 从待响那一堆里拿走**，
+// 「20 秒过去」= 让还挂着的那几个响一次。真无头浏览器里量到的那条坏法（框明明加载好了，
+// t≈20s 那一屏照样被换成「一直没打开」）就是这个形状。
+const withFakeTimers = (fn) => async () => {
+  const pending = [];
+  let seq = 0;
+  const realSetTimeout = globalThis.setTimeout;
+  const realClearTimeout = globalThis.clearTimeout;
+  setGlobal('setTimeout', (cb, ms) => { seq += 1; pending.push({ id: seq, fn: cb, ms }); return seq; });
+  setGlobal('clearTimeout', (id) => {
+    const i = pending.findIndex((one) => one.id === id);
+    if (i >= 0) pending.splice(i, 1);
+  });
+  try { return await fn(pending); } finally {
+    setGlobal('setTimeout', realSetTimeout);
+    setGlobal('clearTimeout', realClearTimeout);
+  }
+};
+/** 挂起那一屏、点开某一台、把框立起来；返回的 `frame` 就是那一屏里的跨源框。 */
+const openFrame = async (box) => {
+  // 上一趟要是没放下（跨机那几样状态是模块级的），先退回名单——不然名单上那一行根本不在树上。
+  const back = byType(box.tree, 'button').find((b) => textOf(b) === '← 返回列表');
+  if (back) { back.props.onClick(); await settlePanel(); }
+  panelRow(box, PANEL_FAR.id).props.onClick();
+  await settlePanel();
+  // 真 React 在提交之后自己跑 effect；这个替身要手点一下（`draw()` 会把没跑过的 effect 丢掉）。
+  box.harness.runEffects();
+  await settlePanel();
+  return byType(box.tree, 'iframe')[0];
+};
+const panelTicketReply = ({ url }) => (url === '/mini-remote/remotes'
+  ? jsonResponse(200, { ok: true, remotes: [PANEL_FAR] })
+  : jsonResponse(200, { ok: true, url: REMOTE_TICKET_URL, expiresIn: 30 }));
+/**
+ * 和 `panelTicketReply` 一样，但**每换一张票地址都不一样**（`&t=<这一趟第几条请求>`）。
+ *
+ * 为什么新写的用例要用它：真机上每一张票都是**一次性凭据**，换一张地址就变一次
+ * （地址里那枚 `?ticket=…` 就是证据）。上面那个替身每次都回同一条地址，于是
+ * "换票之后框照新地址重立"这件事在那一套里量不出来。
+ */
+const ticketReplyEach = ({ url, n }) => (url === '/mini-remote/remotes'
+  ? jsonResponse(200, { ok: true, remotes: [PANEL_FAR] })
+  : jsonResponse(200, { ok: true, url: REMOTE_TICKET_URL + '&t=' + n, expiresIn: 30 }));
+
+const dropPanel = async (box) => {
+  const back = byType(box.tree, 'button').find((b) => textOf(b) === '← 返回列表');
+  if (back) { back.props.onClick(); await settlePanel(); }
+  box.harness.unmount();
+};
+
+// —— 顶上那条横条（2026-10-17 用户要求）：**框正常显示时自动收起，鼠标碰顶再滑出**。
+//
+// 和 lib/page.html 那条镜像顶栏同一套手感：碰顶 16px → 等 0.18 秒 → 滑出；移开 → 等 0.2 秒 → 收起。
+// **只在"框真的显示出来"时才收**：出错、正在换票那几屏，横条上挂着唯一的出路
+// （「← 返回列表」和「再试一次」），藏起来等于把人关在里面。
+
+/** 横条外壳：靠 `transition` 认（收起时 `maxHeight` 归零）。 */
+const barWrapOf = (tree) => walk(tree).find((n) => n && n.props && n.props.style
+  && n.props.style.transition === 'max-height .25s ease');
+/** 感应带：绝对定位、16px 高、贴着顶。 */
+const hotZoneOf = (tree) => walk(tree).find((n) => n && n.props && n.props.style
+  && n.props.style.position === 'absolute' && n.props.style.height === 16);
+
+await check('框正常显示时：顶上那条是收起的，而且留了一条感应带', async () => {
+  const box = await mountPanel(panelTicketReply);
+  await openFrame(box);
+  const wrap = barWrapOf(box.tree);
+  assert.ok(wrap, '横条外壳要在');
+  assert.equal(wrap.props.style.maxHeight, 0, '框正常时它收起——那一行是拿来让给界面的');
+  assert.ok(hotZoneOf(box.tree), '收起了必须留感应带，不然鼠标碰不到、也就再也出不去');
+  // 文字还在树里（只是被 maxHeight 收起来了）：可不能"收起 = 删掉"
+  assert.ok(byType(box.tree, 'button').some((b) => textOf(b) === '← 返回列表'));
+  await dropPanel(box);
+});
+
+await check('鼠标碰顶上 16px：0.18 秒后滑出；移开 0.2 秒后收起', withFakeTimers(async (pending) => {
+  const box = await mountPanel(panelTicketReply);
+  await openFrame(box);
+  const hot = hotZoneOf(box.tree);
+  assert.equal(barWrapOf(box.tree).props.style.maxHeight, 0, '一开始是收起的');
+
+  hot.props.onMouseEnter();
+  const show = pending.find((one) => one.ms === 180);
+  assert.ok(show, '碰顶要挂一个 0.18 秒的钟——不是一碰就弹出来（鼠标常常只是路过）');
+  show.fn();
+  await tick();
+  assert.equal(barWrapOf(box.tree).props.style.maxHeight, 100, '钟响了就该滑出来');
+
+  barWrapOf(box.tree).props.onMouseLeave();
+  const hide = pending.find((one) => one.ms === 200);
+  assert.ok(hide, '离开要挂一个 0.2 秒的钟（光标可能只是从横条上路过）');
+  hide.fn();
+  await tick();
+  assert.equal(barWrapOf(box.tree).props.style.maxHeight, 0, '钟响了就该收回去');
+  await dropPanel(box);
+}));
+
+await check('光标已经回到横条上：那个"0.2 秒后收起"要撤掉，不能把展开的它收走', withFakeTimers(async (pending) => {
+  const box = await mountPanel(panelTicketReply);
+  await openFrame(box);
+  hotZoneOf(box.tree).props.onMouseEnter();
+  pending.find((one) => one.ms === 180).fn();   // 先展开
+  await tick();
+  barWrapOf(box.tree).props.onMouseLeave();     // 挂着"0.2 秒后收"
+  barWrapOf(box.tree).props.onMouseEnter();     // 但光标又回到横条上了
+  assert.equal(pending.some((one) => one.ms === 200), false, '那个收的钟该被撤掉');
+  await tick();
+  assert.equal(barWrapOf(box.tree).props.style.maxHeight, 100, '这一下不许把它收走');
+  await dropPanel(box);
+}));
+
+await check('出错那一屏：横条**常驻**，也不留感应带（它上面挂着唯一的出路）', async () => {
+  const box = await mountPanel(({ url }) => (url === '/mini-remote/remotes'
+    ? jsonResponse(200, { ok: true, remotes: [PANEL_FAR] })
+    : jsonResponse(502, { ok: false, error: '那台电脑已经不认这枚凭据了——多半是它那边把这条记录撤销了。' })));
+  panelRow(box, PANEL_FAR.id).props.onClick();
+  await settlePanel();
+  const wrap = barWrapOf(box.tree);
+  assert.equal(wrap.props.style.maxHeight, 100, '出错时横条必须常驻：它的「再试一次」是这一屏唯一的下一步');
+  assert.equal(hotZoneOf(box.tree), undefined, '常驻的横条不需要感应带——盖着反而挡事');
+  await dropPanel(box);
+});
+
+await check('键盘 Tab 停在横条上：也要把它亮出来（不留"焦点在这、按钮看不见"的坑）', withFakeTimers(async () => {
+  const box = await mountPanel(panelTicketReply);
+  await openFrame(box);
+  assert.equal(barWrapOf(box.tree).props.style.maxHeight, 0, '先是收起的');
+  barWrapOf(box.tree).props.onFocus();
+  await tick();
+  assert.equal(barWrapOf(box.tree).props.style.maxHeight, 100, '焦点进来就要看得见');
+  await dropPanel(box);
+}));
+
+
+/** 这一趟一共发出去几条取票请求——"自动重取只许一次"就是数它。 */
+const ticketAsks = (box) => box.asks.filter((a) => a.url === '/mini-remote/remotes/window').length;
+/** 把这一趟放下：跨机那几样状态在组件外面（模块级），留着后面的用例会看见。 */
+
+await check('框加载成功那一下：20 秒兜底必须被掐掉——**之后永远不许再响**（不许一句错话盖住正常界面）', withFakeTimers(async (pending) => {
+  // ⚠️ **反向验证的靶子**：把 `onLoad` 里那一下 clearTimeout 拿掉（回到"只在依赖变化时清"），
+  //    这一条立刻变红——t=20s 那一屏会被换成「一直没打开」。
+  const box = await mountPanel(panelTicketReply);
+  const frame = await openFrame(box);
+  assert.ok(frame, '票到手了就把那一台的框立起来');
+  assert.equal(pending.filter((one) => one.ms === 20000).length, 1,
+    '框立起来之后，那一个 20 秒兜底必须已经挂上（否则这一条量不到东西）');
+
+  // 框加载成功：真机上是浏览器替我们调这一下（跨源读不到里面，只有这一下能用）。
+  frame.props.onLoad();
+  await settlePanel();
+  assert.equal(pending.filter((one) => one.ms === 20000).length, 0,
+    '**加载成功那一刻，那个 20 秒兜底必须从待响里被拿走**');
+  assert.ok(byType(box.tree, 'iframe')[0], '清兜底的那一下不许把框一起换掉');
+
+  // 「20 秒过去了」：还挂着的那一个响一次（真机上时间到了就会响）。
+  for (const one of pending.filter((each) => each.ms === 20000)) one.fn();
+  await settlePanel();
+  assert.ok(byType(box.tree, 'iframe')[0],
+    '**20 秒过去之后，那一屏必须还是那台电脑的界面**（不许被「一直没打开」换掉）');
+  assert.doesNotMatch(textOf(box.tree), /一直没打开/,
+    '框都加载好了还说"一直没打开"，就是一句错话盖住正常界面');
+
+  await dropPanel(box);
+  assert.equal(pending.filter((one) => one.ms === 20000).length, 0,
+    '放下这一趟（卸下/离开那一屏）之后，手上那个钟照旧不许留着');
+}));
+
+// —— 20 秒兜底到点之后那一下「自动重取一张票、再试一次」（2026-10-17 补的那条约束）。
+//
+// 为什么必须补：拆掉"面板每 25 秒自己换一张票"之后**没有任何自动恢复**，只剩用户手点。
+// 于是"第一次加载被拖过票的寿命（30 秒）、票当场作废"那种洞只能白着一整屏
+// （来龙去脉写在 client.js 的 `remoteAutoRetrySpent` 那一段）。下面三条把新契约钉住：
+//   · 到点**先自动重取一张票**（只这一次），而且那一下**看得见**；
+//   · 自动那一次也没成 → **第二次到点才**给人话 + 「再试一次」，绝不自动取第三张；
+//   · 人手动点「再试一次」**不限次数**（那是人主动的，不是自动的）。
+await check('框一直没打开：20 秒到点**先自动重取一张票、再试一次**（只这一次），而且那一下看得见', withFakeTimers(async (pending) => {
+  // ⚠️ **反向验证的靶子**：把那个钟里"先自动重取"那一段拿掉（回到直接 `setStalled(true)`），
+  //    这一条立刻变红——票只换了一次、屏幕上直接就是那句人话。
+  const box = await mountPanel(ticketReplyEach);
+  const first = await openFrame(box);
+  assert.ok(first, '第一次的框立起来了');
+  assert.equal(ticketAsks(box), 1, '点这一台换过一张票');
+
+  pending.find((one) => one.ms === 20000).fn();   // 到点，而这一次一个 load 都没来过
+  await settlePanel();
+  assert.equal(ticketAsks(box), 2, '**到点必须先自动重取一张票**（票是一次性的：套着旧票重载是白费）');
+  assert.match(textOf(box.tree), /第一次没打开，正在再试一次/,
+    '自动重试那一下**要看得见**——无声地又转一圈，用户会以为界面卡住了');
+
+  // 新的一张票到手：框照新地址再立一次（这就是"再给框一次机会"）。
+  box.harness.runEffects();   // 真 React 里地址变了，那个看门钟会照新地址重挂一个
+  await settlePanel();
+  const again = byType(box.tree, 'iframe')[0];
+  assert.ok(again, '自动重取到票之后，框要照新地址再立一次');
+  assert.notEqual(again.props.src, first.props.src, '地址里换了一张新票（真机上那就是另一枚一次性凭据）');
+  assert.match(textOf(box.tree), /第一次没打开，正在再试一次/,
+    '框重试期间那句话还得在（那 20 秒里框本来就是白的）');
+
+  // 框真的回来了：那句话就该收掉（不许一直挂在屏幕上）。
+  again.props.onLoad();
+  await settlePanel();
+  assert.doesNotMatch(textOf(box.tree), /正在再试一次/, '框 load 回来了，那句"正在再试一次"要收掉');
+  assert.ok(byType(box.tree, 'iframe')[0], '收那句话不许把框一起换掉');
+  assert.equal(ticketAsks(box), 2, '到这儿为止只换了两张票');
+  await dropPanel(box);
+}));
+
+await check('自动重取也没成：**第二次**到点才给人话 + 一个「再试一次」；绝不自动取第三张票', withFakeTimers(async (pending) => {
+  // 这一条和上面那条是一对：**"先自动重取"不等于"每 20 秒自己重试"**。第二次到点必须换成
+  // 一句人话 + 一个下一步（那条现成的路照旧），而且**一张多余的票都不许再换**。
+  const box = await mountPanel(ticketReplyEach);
+  await openFrame(box);
+  pending.filter((one) => one.ms === 20000).pop().fn();   // 第一次到点 → 自动重取那一次
+  await settlePanel();
+  assert.equal(ticketAsks(box), 2, '第一次到点自动重取了一张');
+  box.harness.runEffects();
+  await settlePanel();
+  assert.ok(byType(box.tree, 'iframe')[0], '重试那一次的框立着（还没到点）');
+
+  pending.filter((one) => one.ms === 20000).pop().fn();   // 第二次到点 → 这一次不许再自动重取
+  await settlePanel();
+  assert.equal(ticketAsks(box), 2,
+    '**自动重取只有一次**：这里冒出第三张票，就是"每 20 秒自动重试"那种新的无界行为');
+  // 2026-10-20 改了行为：**框不再被换掉**，改成在它上面叠一条提示。
+  // 理由：跨源读不到框里，`onLoad` 可能因为对面某个资源迟迟不完成而永不触发——那时
+  // 界面其实正常显示着，把它换成一句"一直没打开"才是真伤到用户的那一面。
+  // 所以这里断言的正好反过来：**框还在**，提示条也出来了。
+  assert.equal(byType(box.tree, 'iframe').length, 1,
+    '框要留着（我们判断不了它开没开，不能替用户把它删掉）');
+  assert.match(textOf(box.tree), /还没收到「加载完成」的信号/, '框上面要有一条提示');
+  assert.match(textOf(box.tree), /自动再试了一次|再试一次/, '提示里要给出下一步');
+  await dropPanel(box);
+}));
+
+await check('自动重取那一次**取票就失败**：照旧走现成那条路（一句人话 + 「再试一次」），不许停在"正在再试一次…"', withFakeTimers(async (pending) => {
+  // 自动重取不是"必然成功"的一条路：这一趟没换成票，界面就得照旧给人话 + 下一步。
+  let first = true;
+  const box = await mountPanel(({ url }) => {
+    if (url === '/mini-remote/remotes') return jsonResponse(200, { ok: true, remotes: [PANEL_FAR] });
+    if (first) { first = false; return jsonResponse(200, { ok: true, url: REMOTE_TICKET_URL, expiresIn: 30 }); }
+    return jsonResponse(502, { ok: false, error: '那台电脑已经不认这枚凭据了——多半是它那边把这条记录撤销了。' });
+  });
+  await openFrame(box);
+  pending.find((one) => one.ms === 20000).fn();
+  await settlePanel();
+  const text = textOf(box.tree);
+  assert.match(text, /这台电脑已经被对方撤销了，要重新配对/, '取票失败照旧走现成那条路（宿主那句话原样转述）');
+  assert.doesNotMatch(text, /正在再试一次/, '已经落地了就不许还挂着"正在再试一次…"（那才是转不完的圈）');
+  assert.ok(byType(box.tree, 'button').some((b) => textOf(b) === '再试一次'), '人还有下一步');
+  assert.equal(byType(box.tree, 'iframe').length, 0, '没换到票就别立框');
+  await dropPanel(box);
+}));
+
+await check('顶上那枚「再试一次」**永远在**（框里是错误页也找得到出路），而且手点**不限次数**', async () => {
+  // ⚠️ **反向验证的靶子**：把 remoteScreen 顶上那枚按钮拿掉 → 这一条变红。
+  // 为什么要有它：跨源框读不到里面（`contentDocument` 是 null），"对面回的是一张错误页"
+  // 和"文档到了里面却是空的"这两种**我们看不见、也不猜**（见 client.js 里 onLoad 那一段）。
+  // 能保证的是：不管框里是什么，用户手上永远有一条出去的路。
+  const box = await mountPanel(ticketReplyEach);
+  assert.ok(await openFrame(box), '框立着');
+  const retries = () => byType(box.tree, 'button').filter((b) => textOf(b) === '再试一次');
+  assert.equal(retries().length, 1,
+    '框正常显示着的时候，顶上也要有那枚「再试一次」（框里是什么我们看不见，出路不能只挂在我们的判断上）');
+  // 人按的就是人按的：**不限次数**。连点三次，每一次都真的再换一张票、把框重新立起来。
+  for (let i = 0; i < 3; i += 1) {
+    const before = ticketAsks(box);
+    retries()[0].props.onClick();
+    await settlePanel();
+    assert.equal(ticketAsks(box), before + 1, `第 ${i + 1} 次手点「再试一次」照样再换一张票（人主动的，不限次数）`);
+    assert.doesNotMatch(textOf(box.tree), /正在再试一次/,
+      '人手点的那一次不是"自动重取"，那句话不许冒出来（它会误导成"我按了它自己又转一圈"）');
+    assert.ok(byType(box.tree, 'iframe')[0], '换到票就把框重新立起来');
+  }
+  await dropPanel(box);
+});
+
+// —— sidebar.panellist：list 槽。id 必须和 main 的 key 对上，侧栏点下来才找得到面板。
+await check('panellist 那条：def.name === "sidebar.panellist"', () => {
+  assert.equal(entryOf('sidebar.panellist').def.name, 'sidebar.panellist');
+});
+await check('panellist 那条：id === "mini-remote"，与 main 的 key 一致', () => {
+  assert.equal(entryOf('sidebar.panellist').def.id, 'mini-remote');
+  assert.equal(entryOf('sidebar.panellist').def.id, entryOf('main').def.key);
+});
+await check('panellist 那条：order 是数字（排在官方那两枚之后）', () => {
+  assert.equal(typeof entryOf('sidebar.panellist').def.order, 'number');
+  assert.equal(entryOf('sidebar.panellist').def.order, 20);
+});
+await check('panellist 那条：label() === "远程窗口"', () => {
+  assert.equal(typeof entryOf('sidebar.panellist').def.label, 'function');
+  assert.equal(entryOf('sidebar.panellist').def.label(), '远程窗口');
+});
+await check('侧栏图标：按侧栏给的 size 画，颜色跟着 currentColor', () => {
+  const icon = entryOf('sidebar.panellist').Comp({ size: 18, active: true });
+  const svg = byType(icon, 'svg')[0];
+  assert.ok(svg, '图标应当是一个 svg');
+  assert.equal(svg.props.width, 18, '边长要用侧栏给的那个');
+  assert.equal(svg.props.height, 18);
+  assert.match(JSON.stringify(svg.children), /currentColor/, '颜色不写死，跟着侧栏的选中态走');
+});
+await check('侧栏图标：拿不到 size 时有兜底，不会画成 NaN 宽', () => {
+  const svg = byType(entryOf('sidebar.panellist').Comp({}), 'svg')[0];
+  assert.equal(svg.props.width, 16);
+});
+
+// —— settings.section：原有那一条，形状不变。
+await check('def.name === "settings.section"', () => {
+  const settingsDef = entryOf('settings.section').def;
+  assert.equal(settingsDef.name, 'settings.section');
+});
+await check('def.id === "mini-remote"', () => {
+  assert.equal(entryOf('settings.section').def.id, 'mini-remote');
+});
+await check('def.order === 2', () => {
+  assert.equal(entryOf('settings.section').def.order, 2);
+});
+await check('def.label 是函数（typeof === "function"）', () => {
+  assert.equal(typeof entryOf('settings.section').def.label, 'function');
+});
+await check('def.label() === "遥控设置"', () => {
+  assert.equal(entryOf('settings.section').def.label(), '遥控设置');
+});
+await check('第二个参数是组件函数', () => {
+  Comp = entryOf('settings.section').Comp;
+  assert.equal(typeof Comp, 'function');
+});
+
+// ---------------------------------------------------------------- 4. 渲染组件
+
+const TOKEN = '0123456789abcdef0123456789abcdef';
+const URL_LAN = `http://192.168.1.2:3090/mini?token=${TOKEN}`;
+const URL_TS = `http://100.92.105.99:3090/mini?token=${TOKEN}`;
+const QR = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+
+console.log('\n[4] 组件渲染');
+
+// 4a. 加载中
+let resolveFetch = null;
+setGlobal('fetch', () => new Promise((resolve) => { resolveFetch = resolve; }));
+{
+  const h4 = useHarness();
+  let tree = null;
+  h4.onUpdate(() => { tree = h4.draw(Comp); });
+  await check('挂载时不抛错，并显示「正在读取配对信息…」', () => {
+    tree = h4.draw(Comp);
+    assert.notEqual(tree, undefined);
+    assert.match(textOf(tree), /正在读取配对信息…/);
+  });
+  await check('useEffect 里发起了同源 GET /mini-remote/pairing', () => {
+    h4.runEffects();
+    assert.equal(typeof resolveFetch, 'function', 'useEffect 里没有发起 fetch');
+  });
+  await check('顶部两句说明都在', () => {
+    const text = textOf(tree);
+    assert.match(text, /手机扫码即可连接，密码已编入二维码。/);
+    assert.match(text, /本页包含连接密码，请勿截图或转发。/);
+  });
+  await check('HTTP 403 + {ok:false,error} → 显示 error 原文', async () => {
+    resolveFetch(jsonResponse(403, { ok: false, error: '配对信息只能在这台电脑上看。' }));
+    await tick();
+    assert.match(textOf(tree), /配对信息只能在这台电脑上看。/);
+    assert.doesNotMatch(textOf(tree), /正在读取配对信息…/);
+  });
+}
+
+// 4b. 网络错误（fetch 直接失败）
+{
+  const h4 = useHarness();
+  setGlobal('fetch', () => Promise.reject(new Error('Failed to fetch')));
+  let tree = null;
+  h4.onUpdate(() => { tree = h4.draw(Comp); });
+  await check('网络错误 → 显示失败原因，不吞掉', async () => {
+    tree = h4.draw(Comp);
+    h4.runEffects();
+    await tick();
+    assert.match(textOf(tree), /连不上这台电脑上的遥控服务：Failed to fetch/);
+  });
+}
+
+// 4c. 成功：两条 entry（第二条没有二维码）
+{
+  const h4 = useHarness();
+  setGlobal('fetch', async () => jsonResponse(200, {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [
+      { kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR },
+      { kind: 'tailscale', label: 'Tailscale', hint: '在外面也能用', url: URL_TS, qr: null },
+    ],
+  }));
+  let tree = null;
+  h4.onUpdate(() => { tree = h4.draw(Comp); });
+
+  await check('ok:true 时渲染两块 entry（label + hint）', async () => {
+    tree = h4.draw(Comp);
+    h4.runEffects();
+    await tick();
+    const text = textOf(tree);
+    assert.match(text, /内网/);
+    assert.match(text, /手机连同一个 Wi-Fi 时用这个/);
+    assert.match(text, /Tailscale/);
+    assert.match(text, /在外面也能用/);
+    assert.doesNotMatch(text, /正在读取配对信息…/);
+  });
+
+  await check('二维码渲染成 <img src={entry.qr}>（宽 160）', () => {
+    const imgs = byType(tree, 'img');
+    assert.equal(imgs.length, 1, '有 qr 的只有一条，qr:null 的那条应退化成文字');
+    assert.equal(imgs[0].props.src, QR);
+    assert.equal(imgs[0].props.style.width, 160);
+  });
+
+  await check('两条 URL 都在只读 <input> 里，不是纯文本 div', () => {
+    // 按内容找，不按位置也不数总数：面板上还有别的输入框（密码、改密码那两处），
+    // 数总数的话，每加一个输入框这里都要误报一次。
+    const urls = byType(tree, 'input').filter((n) => n.props.value === URL_LAN || n.props.value === URL_TS);
+    assert.equal(urls.length, 2);
+    assert.equal(urls[0].props.readOnly, true);
+    assert.equal(urls[1].props.readOnly, true);
+  });
+
+  await check('点输入框会全选地址', () => {
+    let selected = false;
+    const lan = byType(tree, 'input').find((n) => n.props.value === URL_LAN);
+    lan.props.onFocus({ target: { select() { selected = true; } } });
+    assert.equal(selected, true);
+  });
+
+  await check('qr 为 null 时退化成文字，界面不崩', () => {
+    assert.match(textOf(tree), /二维码没画出来/);
+  });
+
+  await check('每条链接各有一个「复制地址」按钮，样式统一', () => {
+    const copies = byType(tree, 'button').filter((b) => textOf(b) === '复制地址');
+    assert.ok(copies.length >= 2, '两条链接各要有一个「复制地址」按钮');
+    const style = copies[0].props.style;
+    for (const one of copies) {
+      assert.deepEqual(one.props.style, style, '所有复制按钮共用同一套样式');
+      assert.equal(style.minWidth, 72);
+    }
+  });
+
+  // 2026-09-22 用户报：「手机遥控页面里似乎根本没有密码，也无法自定义密码」。
+  // 配对接口一直返回着 token，只是没人渲染它——这三项钉住它真的露出来了。
+  await check('密码默认打码显示，不是明文', () => {
+    const masked = TOKEN.replace(/./g, '•');
+    const pw = byType(tree, 'input').find((n) => n.props.value === masked);
+    assert.ok(pw, '默认该显示打码后的密码');
+    assert.equal(pw.props.readOnly, true, '密码框只能看，不能改——改要走保存那条路');
+    assert.ok(!byType(tree, 'input').some((n) => n.props.value === TOKEN), '没点「显示」之前不该出现明文');
+  });
+
+  await check('点「显示」→ 明文，再点「藏起来」→ 又打码', async () => {
+    const masked = TOKEN.replace(/./g, '•');
+    const showBtn = byType(tree, 'button').find((b) => textOf(b) === '显示');
+    assert.ok(showBtn, '要有一个「显示」按钮');
+    showBtn.props.onClick();
+    await tick();
+    tree = h4.draw(Comp);
+    assert.ok(byType(tree, 'input').some((n) => n.props.value === TOKEN), '点过之后应显示明文');
+    const hideBtn = byType(tree, 'button').find((b) => textOf(b) === '藏起来');
+    assert.ok(hideBtn, '显示之后按钮该变成「藏起来」');
+    hideBtn.props.onClick();
+    await tick();
+    tree = h4.draw(Comp);
+    assert.ok(byType(tree, 'input').some((n) => n.props.value === masked), '再点一次该变回打码');
+  });
+
+  await check('点密码旁边的「复制密码」→ 复制的是密码本身', async () => {
+    const written = [];
+    setGlobal('navigator', { clipboard: { writeText: async (text) => { written.push(text); } } });
+    const copyPwd = byType(tree, 'button').find((b) => textOf(b) === '复制密码');
+    assert.ok(copyPwd, '密码旁边要有独立的复制入口');
+    copyPwd.props.onClick();
+    await tick();
+    assert.deepEqual(written, [TOKEN]);
+  });
+
+  await check('点「复制地址」→ navigator.clipboard.writeText(url)，文案变「已复制」', async () => {
+    const written = [];
+    setGlobal('navigator', { clipboard: { writeText: async (text) => { written.push(text); } } });
+    const first = byType(tree, 'button').find((b) => textOf(b) === '复制地址');
+    first.props.onClick();
+    await tick();
+    assert.deepEqual(written, [URL_LAN]);
+    assert.equal(textOf(byType(tree, 'button').find((b) => textOf(b) === '已复制')), '已复制');
+    assert.ok(byType(tree, 'button').some((b) => textOf(b) === '复制密码'), '只改被点的那一个');
+  });
+
+  await check('复制失败时不谎报「已复制」', async () => {
+    const h5 = useHarness();
+    let tree5 = null;
+    h5.onUpdate(() => { tree5 = h5.draw(Comp); });
+    tree5 = h5.draw(Comp);
+    h5.runEffects();
+    await tick();
+    setGlobal('navigator', { clipboard: { writeText: async () => { throw new Error('NotAllowedError'); } } });
+    byType(tree5, 'button').find((b) => textOf(b) === '复制地址').props.onClick();
+    await tick();
+    assert.equal(textOf(byType(tree5, 'button').find((b) => textOf(b) === '复制地址')), '复制地址');
+  });
+}
+
+// 4d. 公网访问：开关、状态、报错、以及 ok:false 时也要能关掉它
+{
+  const withTunnel = (tunnel, extra) => Object.assign({
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel,
+  }, extra || {});
+
+  const h6 = useHarness();
+  let tree6 = null;
+  let posted = [];
+  h6.onUpdate(() => { tree6 = h6.draw(Comp); });
+
+  const mount = async (payload) => {
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') {
+        posted.push({ url, body: JSON.parse(init.body) });
+        return jsonResponse(200, withTunnel({ enabled: JSON.parse(init.body).enabled, up: false, starting: false, error: null }));
+      }
+      return jsonResponse(200, payload);
+    });
+    tree6 = h6.draw(Comp);
+    h6.runEffects();
+    await tick();
+    await expandSettingsGroup(tree6, 'external');
+    await expandExternalSubs(() => tree6);
+  };
+
+  await check('公网没开时：开关是未选中的，并且说明「出门进不来」', async () => {
+    await mount(withTunnel({ enabled: false, up: false, starting: false, error: null }));
+    const boxes = byType(tree6, 'input').filter((n) => n.props.type === 'checkbox');
+    assert.equal(boxes.length, 2, '快速隧道和 A 中继各有一个开关');
+    assert.equal(boxes[0].props.checked, false);
+    const text = textOf(tree6);
+    assert.match(text, /公网访问/);
+    assert.match(text, /手机与电脑不在同一网络时无法连接；可改用 Tailscale 或下面的固定地址。/);
+    assert.doesNotMatch(text, /检测到系统代理|检测到本机代理|当前代理是 TUN/, '没有 proxyCompat 时不显示代理提示');
+    assert.equal(byType(tree6, 'button').some((b) => textOf(b) === '复制直连规则'), false);
+  });
+
+  await check('系统代理时显示代理提示', async () => {
+    await mount(withTunnel(
+      { enabled: false, up: false, starting: false, error: null },
+      { proxyCompat: { detected: true, systemProxy: true, envProxy: false, tun: false, bypassApplied: false } },
+    ));
+    const text = textOf(tree6);
+    assert.match(text, /cloudflared 通常直连/);
+    assert.match(text, /cloudflared 通常直连/);
+    assert.doesNotMatch(text, /复制直连规则/);
+    assert.doesNotMatch(text, /127\.0\.0\.1:7890|proxy-password/);
+  });
+
+  await check('检测到 TUN 时提示关闭 TUN 再试', async () => {
+    await mount(withTunnel(
+      { enabled: true, up: false, starting: false, error: '连接超时' },
+      { proxyCompat: { detected: true, systemProxy: true, envProxy: true, tun: true, bypassApplied: false } },
+    ));
+    const text = textOf(tree6);
+    assert.match(text, /当前代理是 TUN 模式；隧道连不上时，请关闭 TUN 后再试/);
+    assert.doesNotMatch(text, /cloudflared 直连|专属固定地址替代路线/);
+    assert.equal(byType(tree6, 'button').some((b) => textOf(b) === '复制直连规则'), false);
+  });
+
+  await check('公网开着且有地址时：开关选中，提示去看「公网」那条', async () => {
+    await mount(withTunnel({ enabled: true, up: true, starting: false, error: null }));
+    const boxes = byType(tree6, 'input').filter((n) => n.props.type === 'checkbox');
+    assert.equal(boxes[0].props.checked, true);
+    const text = textOf(tree6);
+    assert.match(text, /上方「公网」即外部访问地址/);
+    assert.match(text, /每次重启 DSH 后地址会变化，需重新扫码。/, '要提前说清楚地址会变');
+    assert.match(text, /挂在公网上/, '开了要提醒它现在暴露在公网');
+  });
+
+  await check('公网开着但连不上时：原文报错照登，不吞掉', async () => {
+    await mount(withTunnel({ enabled: true, up: false, starting: false, error: '所有下载源都没成功：\n  github.com — 超时' }));
+    const text = textOf(tree6);
+    assert.match(text, /开着，但公网那边连不上/, '要让用户知道这条路现在是死的');
+    assert.match(text, /所有下载源都没成功/, '底层原因要透出来，否则没法排查');
+    assert.match(text, /github\.com — 超时/);
+  });
+
+  // 2026-09-22 用户照着一个写着「已开启」的面板去扫码，扫出来是 Cloudflare 的 Error 1033。
+  // 这两种情况必须分开说：**还在等地址**和**地址拿到过、后来断了**，用户的下一步动作不同。
+  await check('公网开着、没有报错时：说的是「还没拿到地址」，不是「连不上」', async () => {
+    await mount(withTunnel({ enabled: true, up: false, starting: false, error: null }));
+    const text = textOf(tree6);
+    assert.match(text, /已开启，但还没拿到公网地址/);
+    assert.doesNotMatch(text, /公网那边连不上/, '还没报错就不该先吓唬人');
+  });
+
+  await check('正在打开时：开关禁用，避免连点起出好几条隧道', async () => {
+    await mount(withTunnel({ enabled: true, up: false, starting: true, error: null }));
+    const boxes = byType(tree6, 'input').filter((n) => n.props.type === 'checkbox');
+    assert.equal(boxes[0].props.disabled, true);
+    assert.match(textOf(tree6), /正在打开/);
+  });
+
+  await check('勾上开关 → POST /mini-remote/tunnel，body 是 {enabled:true}', async () => {
+    posted = [];
+    await mount(withTunnel({ enabled: false, up: false, starting: false, error: null }));
+    const box = byType(tree6, 'input').filter((n) => n.props.type === 'checkbox')[0];
+    box.props.onChange({ target: { checked: true } });
+    await tick();
+    assert.equal(posted.length, 1, '只该发一次请求');
+    assert.equal(posted[0].url, '/mini-remote/tunnel');
+    assert.deepEqual(posted[0].body, { enabled: true, mode: 'quick' });
+  });
+
+  await check('关掉开关 → body 是 {enabled:false}', async () => {
+    posted = [];
+    await mount(withTunnel({ enabled: true, up: true, starting: false, error: null }));
+    const box = byType(tree6, 'input').filter((n) => n.props.type === 'checkbox')[0];
+    box.props.onChange({ target: { checked: false } });
+    await tick();
+    assert.equal(posted.length, 1);
+    assert.deepEqual(posted[0].body, { enabled: false, mode: 'quick' });
+  });
+
+  await check('A 固定中继：显示状态，打开时 POST 带 relayEnabled', async () => {
+    posted = [];
+    await mount(withTunnel(
+      { enabled: true, up: true, starting: false, error: null },
+      { relay: { enabled: false, state: 'waiting-tunnel', publicUrl: null, error: null, hasInviteCode: false } },
+    ));
+    const text = textOf(tree6);
+    assert.match(text, /共享固定地址/);
+    const boxes = byType(tree6, 'input').filter((n) => n.props.type === 'checkbox');
+    assert.equal(boxes.length, 2);
+    boxes[1].props.onChange({ target: { checked: true } });
+    await tick();
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].body.relayEnabled, true);
+    assert.equal(posted[0].body.mode, 'quick');
+  });
+
+  await check('A 固定中继：登记成功后清空本机邀请码输入', async () => {
+    posted = [];
+    const runningTunnel = { enabled: true, up: true, starting: false, error: null };
+    const off = withTunnel(runningTunnel, {
+      relay: { enabled: false, state: 'waiting-tunnel', publicUrl: null, error: null, hasInviteCode: false },
+    });
+    await mount(off);
+    const draft = byType(tree6, 'input').find((n) => String(n.props.placeholder).includes('邀请码'));
+    draft.props.onChange({ target: { value: 'invite-once' } });
+    await tick();
+    const active = withTunnel(runningTunnel, {
+      relay: {
+        enabled: true,
+        state: 'active',
+        publicUrl: 'https://abcdefghijklmnopqrstuvwxyz.relay.example.com',
+        error: null,
+        hasInviteCode: false,
+        id: 'abcdefghijklmnopqrstuvwxyz',
+      },
+    });
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') {
+        posted.push({ url, body: JSON.parse(init.body) });
+        return jsonResponse(200, active);
+      }
+      return jsonResponse(200, off);
+    });
+    byType(tree6, 'button').find((n) => textOf(n) === '保存固定中继').props.onClick();
+    await tick();
+    assert.equal(posted[0].body.relayInviteCode, 'invite-once');
+    const cleared = byType(tree6, 'input').find((n) => String(n.props.placeholder).includes('邀请码'));
+    assert.equal(cleared.props.value, '');
+  });
+
+  await check('A 固定中继：已有身份时禁用邀请码，保存不再发送旧邀请码', async () => {
+    const runningTunnel = { enabled: true, up: true, starting: false, error: null };
+    await mount(withTunnel(runningTunnel,
+      { relay: { enabled: false, state: 'waiting-tunnel', publicUrl: null, error: null, hasInviteCode: false } }));
+    const draft = byType(tree6, 'input').find((n) => String(n.props.placeholder).includes('邀请码'));
+    draft.props.onChange({ target: { value: 'old-invite-code' } });
+    await tick();
+
+    await mount(withTunnel(runningTunnel,
+      { relay: { enabled: false, state: 'paused', publicUrl: null, error: null, hasInviteCode: true, id: 'abcdefghijklmnopqrstuvwxyz' } }));
+    const input = byType(tree6, 'input').find((n) => n.props.value === 'old-invite-code');
+    assert.ok(input);
+    assert.equal(input.props.disabled, true);
+    assert.match(textOf(tree6), /已有身份；要换邀请码请先清空本地共享身份/);
+    posted = [];
+    byType(tree6, 'button').find((n) => textOf(n) === '保存固定中继').props.onClick();
+    await tick();
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].body.relayInviteCode, '');
+  });
+
+  await check('A 固定中继：停止和清空按钮会发对应 action', async () => {
+    posted = [];
+    await mount(withTunnel(
+      { enabled: true, up: true, starting: false, error: null },
+      { relay: { enabled: true, state: 'active', publicUrl: 'https://abcdefghijklmnopqrstuvwxyz.relay.example.com', error: null, hasInviteCode: true, id: 'abcdefghijklmnopqrstuvwxyz' } },
+    ));
+    assert.equal(byType(tree6, 'button').some((n) => textOf(n) === '保存固定中继'), false, '已启用后不该再显示保存按钮');
+    const stop = byType(tree6, 'button').find((n) => textOf(n) === '停止共享固定地址');
+    assert.ok(stop, '要有停止按钮');
+    stop.props.onClick();
+    await tick();
+    assert.deepEqual(posted[0], { url: '/mini-remote/tunnel', body: { action: 'relay-stop' } });
+
+    posted = [];
+    await mount(withTunnel(
+      { enabled: true, up: true, starting: false, error: null },
+      { relay: { enabled: true, state: 'active', publicUrl: 'https://abcdefghijklmnopqrstuvwxyz.relay.example.com', error: null, hasInviteCode: true, id: 'abcdefghijklmnopqrstuvwxyz' } },
+    ));
+    const reset = byType(tree6, 'button').find((n) => textOf(n) === '清空本地共享身份');
+    assert.ok(reset, '要有清空按钮');
+    const oldWindow = globalThis.window;
+    globalThis.window = { confirm: () => true };
+    reset.props.onClick();
+    globalThis.window = oldWindow;
+    await tick();
+    assert.deepEqual(posted[0], { url: '/mini-remote/tunnel', body: { action: 'relay-reset' } });
+  });
+
+  await check('整块面板报错时，公网开关仍然露得出来', async () => {
+    // 否则「隧道起不来」会把面板变成一条报错，用户连关掉它的地方都找不到
+    await mount(withTunnel(
+      { enabled: true, up: false, starting: false, error: '找不到 cloudflared' },
+      { ok: false, error: '公网访问没起来：找不到 cloudflared', entries: undefined },
+    ));
+    const boxes = byType(tree6, 'input').filter((n) => n.props.type === 'checkbox');
+    assert.equal(boxes.length, 2, '报错时快速隧道和 A 中继开关都得在');
+    assert.equal(boxes[0].props.checked, true);
+    assert.match(textOf(tree6), /公网访问没起来/);
+  });
+}
+
+// 4d-2. Cloudflare 命名隧道：固定地址 + token
+{
+  const payload = {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: {
+      enabled: true,
+      mode: 'named',
+      publicUrl: 'https://dsh.example.com',
+      hasToken: true,
+      up: true,
+      starting: false,
+      error: null,
+    },
+  };
+  const h7 = useHarness();
+  let tree7 = null;
+  const posted7 = [];
+  h7.onUpdate(() => { tree7 = h7.draw(Comp); });
+  setGlobal('fetch', async (url, init) => {
+    if (init && init.method === 'POST') {
+      posted7.push({ url, body: JSON.parse(init.body) });
+      return jsonResponse(200, payload);
+    }
+    return jsonResponse(200, payload);
+  });
+  tree7 = h7.draw(Comp);
+  h7.runEffects();
+  await tick();
+  h7.runEffects();
+  await tick();
+  await expandSettingsGroup(tree7, 'external');
+    await expandExternalSubs(() => tree7);
+
+  await check('固定域名隧道：地址回填，保存时带 mode=named', async () => {
+    const text = textOf(tree7);
+    assert.match(text, /固定地址（Cloudflare 命名隧道）/);
+    const inputs = byType(tree7, 'input');
+    const urlInput = inputs.find((n) => n.props.value === 'https://dsh.example.com');
+    assert.ok(urlInput, '公网地址要回填');
+    const tokenInput = inputs.find((n) => n.props.type === 'password'
+      && /已经存过一份了/.test(String(n.props.placeholder)));
+    assert.ok(tokenInput, 'token 要用密码框');
+    assert.match(tokenInput.props.placeholder, /已经存过一份了，留空就不改动它/);
+    assert.doesNotMatch(text, /已发布应用/, '配置指引默认收起');
+    const guideBtn = byType(tree7, 'button').find((b) => textOf(b) === '配置指引（Cloudflare 六步）');
+    assert.ok(guideBtn, '命名隧道末尾要有配置指引按钮');
+    guideBtn.props.onClick();
+    await tick();
+    assert.match(textOf(tree7), /已发布应用/, '展开后要看到 Public Hostname 这一步');
+    assert.ok(byType(tree7, 'button').find((b) => textOf(b) === '收起配置指引'), '按钮要变成收起');
+    const saveBtn = byType(tree7, 'button').find((b) => textOf(b) === '保存并重启');
+    assert.ok(saveBtn, '命名隧道要有保存并重启');
+    saveBtn.props.onClick();
+    await tick();
+    assert.equal(posted7.length, 1);
+    assert.equal(posted7[0].url, '/mini-remote/tunnel');
+    assert.deepEqual(posted7[0].body, {
+      enabled: true,
+      mode: 'named',
+      namedToken: '',
+      publicUrl: 'https://dsh.example.com',
+    });
+  });
+}
+
+// 4d-2b. 手动公网地址：只展示/保存，不建立隧道
+{
+  const payload = {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: { enabled: false, mode: 'quick', publicUrl: null, hasToken: false, up: false, starting: false, error: null },
+    manualPublicUrl: 'https://machine.tailnet.ts.net:10000',
+  };
+  const hManual = useHarness();
+  let treeManual = null;
+  const postedManual = [];
+  hManual.onUpdate(() => { treeManual = hManual.draw(Comp); });
+  setGlobal('fetch', async (url, init) => {
+    if (init && init.method === 'POST') {
+      postedManual.push({ url, body: JSON.parse(init.body) });
+      return jsonResponse(200, payload);
+    }
+    return jsonResponse(200, payload);
+  });
+  treeManual = hManual.draw(Comp);
+  hManual.runEffects();
+  await tick();
+  hManual.runEffects();
+  await tick();
+  await expandSettingsGroup(treeManual, 'external');
+  await expandExternalSubs(() => treeManual);
+
+  await check('手动公网地址：回填、保存到独立路由，不碰隧道', async () => {
+    const text = textOf(treeManual);
+    assert.match(text, /手动公网地址/);
+    const input = byType(treeManual, 'input').find((n) => n.props.value === 'https://machine.tailnet.ts.net:10000');
+    assert.ok(input, '手动公网地址要回填');
+    const saveBtn = byType(treeManual, 'button').find((b) => textOf(b) === '保存地址');
+    assert.ok(saveBtn, '要有保存地址按钮');
+    const guideBtn = byType(treeManual, 'button').find((b) => textOf(b) === '配置指引');
+    assert.ok(guideBtn, '要有 Tailscale Funnel 配置指引');
+    assert.doesNotMatch(text, /tailscale funnel --bg/, '配置指引默认收起');
+    guideBtn.props.onClick();
+    await tick();
+    assert.match(textOf(treeManual), /tailscale funnel --bg --https=10000 3090/);
+    assert.ok(byType(treeManual, 'button').find((b) => textOf(b) === '收起配置指引'), '按钮要变成收起');
+    saveBtn.props.onClick();
+    await tick();
+    assert.equal(postedManual.length, 1);
+    assert.equal(postedManual[0].url, '/mini-remote/manual-url');
+    assert.deepEqual(postedManual[0].body, { publicUrl: 'https://machine.tailnet.ts.net:10000' });
+  });
+}
+
+// 4d-3. 命名隧道恢复中：状态和「立即重试」
+{
+  const payload = {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: {
+      enabled: true,
+      mode: 'named',
+      publicUrl: 'https://dsh.example.com',
+      hasToken: true,
+      up: true,
+      starting: true,
+      error: 'TLS handshake with edge error: EOF',
+      phase: 'restarting',
+      attempts: 1,
+      nextRetryAt: null,
+      lastErrorKind: 'edge',
+      publicHealthy: false,
+    },
+  };
+  const h8 = useHarness();
+  let tree8 = null;
+  const posted8 = [];
+  h8.onUpdate(() => { tree8 = h8.draw(Comp); });
+  setGlobal('fetch', async (url, init) => {
+    if (init && init.method === 'POST') {
+      posted8.push({ url, body: JSON.parse(init.body) });
+      return jsonResponse(200, payload);
+    }
+    return jsonResponse(200, payload);
+  });
+  tree8 = h8.draw(Comp);
+  h8.runEffects();
+  await tick();
+  h8.runEffects();
+  await tick();
+  await expandSettingsGroup(tree8, 'external');
+    await expandExternalSubs(() => tree8);
+
+  await check('命名隧道恢复中：说正在恢复，并给立即重试', async () => {
+    const text = textOf(tree8);
+    assert.match(text, /隧道断了，正在恢复/);
+    const retryBtn = byType(tree8, 'button').find((b) => textOf(b) === '立即重试');
+    assert.ok(retryBtn, '恢复中要有立即重试');
+    retryBtn.props.onClick();
+    await tick();
+    assert.equal(posted8.length, 1);
+    assert.equal(posted8[0].url, '/mini-remote/tunnel');
+    assert.deepEqual(posted8[0].body, { enabled: true, action: 'retry' });
+  });
+}
+
+// 4d-4. B 固定地址（服务方代建）：激活码、运行状态、固定地址、停止
+{
+  const B_HOST = 'abcdefghijklmnopqrstuvwxyz.dsh-everywhere.com';
+  const base = (bRelay) => ({
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: null,
+    serve: null,
+    feishu: null,
+    bRelay,
+  });
+
+  const runningReply = base({
+    enabled: true,
+    state: 'running',
+    configured: true,
+    hasActivationCode: true,
+    hostname: B_HOST,
+    url: 'https://' + B_HOST,
+    lastError: null,
+    error: null,
+    errorCode: null,
+  });
+  const releasedReply = {
+    ok: true,
+    bRelay: {
+      enabled: false,
+      state: 'released',
+      configured: true,
+      hasActivationCode: true,
+      hostname: B_HOST,
+      url: 'https://' + B_HOST,
+      lastError: null,
+      error: null,
+      errorCode: null,
+    },
+  };
+
+  const h9 = useHarness();
+  let tree9 = null;
+  let posted9 = [];
+  h9.onUpdate(() => { tree9 = h9.draw(Comp); });
+  const mount9 = async (payload) => {
+    setGlobal('fetch', async (url, init) => {
+      if (url === '/mini-remote/b-relay' && init && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        posted9.push(body);
+        return jsonResponse(200, body.action === 'stop' ? releasedReply : runningReply);
+      }
+      return jsonResponse(200, payload);
+    });
+    tree9 = h9.draw(Comp);
+    h9.runEffects();
+    await tick();
+    h9.runEffects();
+    await tick();
+    await expandSettingsGroup(tree9, 'external');
+    await expandExternalSubs(() => tree9);
+  };
+
+  await check('B 固定地址 running：显示固定地址，停止按钮 POST action=stop', async () => {
+    posted9 = [];
+    await mount9(runningReply);
+    const text = textOf(tree9);
+    assert.match(text, /专属固定地址/);
+    assert.ok(byType(tree9, 'input').some((n) => String(n.props.value).includes(B_HOST)),
+      '固定地址要摆在只读输入框里');
+    assert.match(text, /已连接/);
+    const stop = byType(tree9, 'button').find((b) => textOf(b) === '停止专属固定地址');
+    assert.ok(stop, '运行中要有停止入口');
+    stop.props.onClick();
+    await tick();
+    assert.equal(posted9.length, 1);
+    assert.deepEqual(posted9[0], { action: 'stop' });
+    assert.match(textOf(tree9), /未开启/);
+    h9.unmount();
+  });
+
+  await check('B 固定地址未开启：输入激活码后开启，POST 带上激活码并显示固定地址', async () => {
+    posted9 = [];
+    const off = base({
+      enabled: false,
+      state: 'idle',
+      configured: false,
+      hasActivationCode: false,
+      hostname: '',
+      url: null,
+      lastError: null,
+      error: null,
+      errorCode: null,
+    });
+    await mount9(off);
+    const codeInput = byType(tree9, 'input').find((n) => n.props.type === 'password'
+      && /激活码/.test(String(n.props.placeholder)));
+    assert.ok(codeInput, '未开启时要有激活码密码框');
+    const secret = 'z'.repeat(43);
+    codeInput.props.onChange({ target: { value: secret } });
+    await tick();
+    const start = byType(tree9, 'button').find((b) => textOf(b) === '开启专属固定地址');
+    assert.ok(start, '要有开启按钮');
+    start.props.onClick();
+    await tick();
+    assert.equal(posted9.length, 1);
+    assert.deepEqual(posted9[0], { action: 'start', activationCode: secret });
+    assert.ok(byType(tree9, 'input').some((n) => String(n.props.value).includes(B_HOST)),
+      '开通成功后要显示固定地址');
+    h9.unmount();
+  });
+
+  await check('B 固定地址失败：显示立即重试按钮，点击 POST action=retry', async () => {
+    posted9 = [];
+    const failed = base({
+      enabled: true,
+      state: 'error',
+      configured: true,
+      hasActivationCode: true,
+      hostname: B_HOST,
+      url: 'https://' + B_HOST,
+      lastError: 'cloudflared 启动超时，没有连上 Cloudflare。',
+      error: { code: 'cloudflared_start_failed', retryable: false, message: 'cloudflared 启动超时，没有连上 Cloudflare。' },
+      errorCode: 'cloudflared_start_failed',
+      reconnectable: false,
+    });
+    await mount9(failed);
+    const retry = byType(tree9, 'button').find((b) => textOf(b) === '立即重试');
+    assert.ok(retry, '失败状态要有立即重试按钮');
+    retry.props.onClick();
+    await tick();
+    assert.equal(posted9.length, 1);
+    assert.deepEqual(posted9[0], { action: 'retry' });
+    h9.unmount();
+  });
+
+  await check('B 身份错误：仅清本地身份按钮经过确认后 POST purge-local', async () => {
+    for (const errorCode of ['auth_failed', 'identity_mismatch', 'cf_api_unavailable']) {
+      posted9 = [];
+      await mount9(base({
+        enabled: true,
+        state: 'error',
+        configured: true,
+        hasActivationCode: false,
+        hostname: B_HOST,
+        url: 'https://' + B_HOST,
+        lastError: '本机身份与云端租约不一致。',
+        error: { code: errorCode, retryable: false, message: '本机身份与云端租约不一致。' },
+        errorCode,
+        reconnectable: false,
+      }));
+      const purgeLocal = byType(tree9, 'button').find((b) => textOf(b) === '仅清本地身份（不删云端）');
+      assert.ok(purgeLocal, errorCode + ' 要显示仅清本地身份按钮');
+      let confirmation = '';
+      const previousConfirm = globalThis.window.confirm;
+      globalThis.window.confirm = (message) => { confirmation = message; return true; };
+      try {
+        purgeLocal.props.onClick();
+      } finally {
+        globalThis.window.confirm = previousConfirm;
+      }
+      await tick();
+      assert.match(confirmation, /不删除云端旧资源/);
+      assert.match(confirmation, /可能仍然保留/);
+      assert.deepEqual(posted9[0], { action: 'purge-local' });
+      h9.unmount();
+    }
+  });
+}
+
+// 4d-5. 自建多用户中继：控制台地址、邀请码、停止/重连、复制固定地址
+{
+  const MULTI_CONTROL = 'https://admin.relay.example.com';
+  const MULTI_HOST = 'abcdefghijklmnopqrstuvwxyz.relay.example.com';
+  const withMulti = (multiRelay, extra) => Object.assign({
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: null,
+    bRelay: null,
+    selfRelay: null,
+    serve: null,
+    feishu: null,
+    multiRelay,
+  }, extra || {});
+
+  const runningMulti = withMulti({
+    enabled: true,
+    state: 'running',
+    controlUrl: MULTI_CONTROL,
+    publicHost: MULTI_HOST,
+    url: 'https://' + MULTI_HOST,
+    reconnectable: true,
+    lastError: null,
+    error: null,
+    errorCode: null,
+  });
+  const resetMulti = {
+    ok: true,
+    multiRelay: {
+      enabled: false,
+      state: 'idle',
+      controlUrl: '',
+      publicHost: '',
+      url: null,
+      reconnectable: false,
+      lastError: null,
+      error: null,
+      errorCode: null,
+    },
+  };
+  const stoppedMulti = {
+    ok: true,
+    multiRelay: {
+      enabled: false,
+      state: 'idle',
+      controlUrl: MULTI_CONTROL,
+      publicHost: MULTI_HOST,
+      url: 'https://' + MULTI_HOST,
+      reconnectable: true,
+      lastError: null,
+      error: null,
+      errorCode: null,
+    },
+  };
+
+  const h10 = useHarness();
+  let tree10 = null;
+  let posted10 = [];
+  h10.onUpdate(() => { tree10 = h10.draw(Comp); });
+  const mount10 = async (payload) => {
+    setGlobal('fetch', async (url, init) => {
+      if (url === '/mini-remote/multi-relay' && init && init.method === 'POST') {
+        const body = JSON.parse(init.body);
+        posted10.push(body);
+        if (body.action === 'stop') return jsonResponse(200, stoppedMulti);
+        if (body.action === 'reset') return jsonResponse(200, resetMulti);
+        return jsonResponse(200, runningMulti);
+      }
+      return jsonResponse(200, payload);
+    });
+    tree10 = h10.draw(Comp);
+    h10.runEffects();
+    await tick();
+    h10.runEffects();
+    await tick();
+    await expandSettingsGroup(tree10, 'external');
+    await expandExternalSubs(() => tree10);
+  };
+
+  await check('自建多用户中继 running：显示固定地址、重连/停止按钮和复制反馈', async () => {
+    posted10 = [];
+    await mount10(runningMulti);
+    const text = textOf(tree10);
+    assert.match(text, /自建多用户中继/);
+    assert.match(text, /已连接/);
+    assert.ok(byType(tree10, 'input').some((n) => String(n.props.value).includes(MULTI_HOST)),
+      '固定地址要摆在只读输入框里');
+    assert.ok(byType(tree10, 'button').some((b) => textOf(b) === '重新连接'), '要有重新连接按钮');
+    assert.ok(byType(tree10, 'button').some((b) => textOf(b) === '停止'), '要有停止按钮');
+    assert.ok(byType(tree10, 'button').some((b) => textOf(b) === '复制地址'), '要有复制地址按钮');
+    assert.doesNotMatch(text, /先判断：这条路适合你吗/, '配置指引默认收起');
+    const guideBtn = byType(tree10, 'button').find((b) => textOf(b) === '配置指引：怎么自己搭一个？');
+    assert.ok(guideBtn, '板块底部要有配置指引按钮');
+    guideBtn.props.onClick();
+    await tick();
+    assert.match(textOf(tree10), /先判断：这条路适合你吗/, '展开后要看到适不适合的判断');
+    assert.match(textOf(tree10), /一台一直开着的远程电脑/, '要用大白话解释服务器');
+    assert.match(textOf(tree10), /不会登录服务器/, '要给不会命令行的人一个退路');
+    assert.match(textOf(tree10), /github.com\/xingzhen199186\/dsh-everywhere/, '要告诉用户安装包去哪里找');
+    assert.match(textOf(tree10), /cd relay-multi/, '要给可执行的命令');
+    assert.match(textOf(tree10), /Not Found/, '要提醒根路径不是管理页');
+    assert.match(textOf(tree10), /PYTHONPATH=\/opt\/relay-multi/, '重置命令要带正确的模块路径');
+    assert.ok(byType(tree10, 'button').find((b) => textOf(b) === '收起配置指引'), '按钮要变成收起');
+
+    const written = [];
+    setGlobal('navigator', { clipboard: { writeText: async (value) => { written.push(value); } } });
+    const multiBlock = walk(tree10).find((n) => n && n.props && n.props.key === 'multi-relay');
+    const copy = byType(multiBlock, 'button').find((b) => textOf(b) === '复制地址');
+    copy.props.onClick();
+    await tick();
+    assert.deepEqual(written, ['https://' + MULTI_HOST]);
+    const refreshed = walk(tree10).find((n) => n && n.props && n.props.key === 'multi-relay');
+    assert.equal(textOf(byType(refreshed, 'button').find((b) => textOf(b) === '已复制')), '已复制');
+
+    const stop = byType(tree10, 'button').find((b) => textOf(b) === '停止');
+    stop.props.onClick();
+    await tick();
+    assert.deepEqual(posted10[0], { action: 'stop' });
+    h10.unmount();
+  });
+
+  await check('自建多用户中继未开通：填控制台地址和邀请码，POST start，成功后清空邀请码', async () => {
+    posted10 = [];
+    const off = withMulti({
+      enabled: false,
+      state: 'idle',
+      controlUrl: MULTI_CONTROL,
+      publicHost: '',
+      url: null,
+      reconnectable: false,
+      lastError: null,
+      error: null,
+      errorCode: null,
+    });
+    await mount10(off);
+    const ticketInput = byType(tree10, 'input').find((n) => n.props.type === 'password'
+      && /邀请票/.test(String(n.props.placeholder)));
+    assert.ok(ticketInput, '默认要有邀请票输入框');
+    assert.match(ticketInput.props.placeholder, /邀请票/);
+    assert.ok(!byType(tree10, 'input').some((n) => n.props.type === 'url'), '默认不暴露控制台地址');
+    const advanced = byType(tree10, 'button').find((b) => textOf(b) === '高级模式：管理员自用（地址 + 密码）');
+    assert.ok(advanced, '要有高级模式入口');
+    advanced.props.onClick();
+    await tick();
+    const inputs = byType(tree10, 'input');
+    const urlInput = inputs.find((n) => n.props.type === 'url');
+    assert.ok(urlInput, '高级模式要有控制台地址输入框');
+    assert.equal(urlInput.props.value, MULTI_CONTROL);
+    assert.ok(!inputs.some((n) => String(n.props.placeholder).includes('一次性邀请码')), '高级模式不再有邀请码输入框');
+    const adminInput = inputs.find((n) => n.props.type === 'password' && String(n.props.placeholder).includes('管理员自用'));
+    assert.ok(adminInput, '高级模式要有管理员密码输入框');
+    adminInput.props.onChange({ target: { value: 'admin-secret' } });
+    await tick();
+    const start = byType(tree10, 'button').find((b) => textOf(b) === '开通并连接');
+    assert.ok(start, '要有开通并连接按钮');
+    start.props.onClick();
+    await tick();
+    assert.equal(posted10.length, 1);
+    assert.deepEqual(posted10[0], {
+      action: 'start',
+      controlUrl: MULTI_CONTROL,
+      adminPassword: 'admin-secret',
+    });
+    assert.ok(byType(tree10, 'input').some((n) => String(n.props.value).includes(MULTI_HOST)),
+      '开通成功后要显示固定地址');
+    const ticketAfter = byType(tree10, 'input').find((n) => n.props.type === 'password'
+      && /邀请票/.test(String(n.props.placeholder)) || /已有身份/.test(String(n.props.placeholder)));
+    assert.ok(ticketAfter, '开通后仍要有邀请票框');
+    assert.equal(ticketAfter.props.value, '', '开通成功后邀请票要清空');
+    assert.doesNotMatch(textOf(tree10), /frpToken/i, '界面不显示 token');
+    h10.unmount();
+  });
+
+  await check('自建多用户中继：粘贴邀请票后只 POST ticket，不需要控制台地址', async () => {
+    posted10 = [];
+    const off = withMulti({
+      enabled: false,
+      state: 'idle',
+      controlUrl: '',
+      publicHost: '',
+      url: null,
+      reconnectable: false,
+      lastError: null,
+      error: null,
+      errorCode: null,
+    });
+    await mount10(off);
+    const ticketInput = byType(tree10, 'input').find((n) => n.props.type === 'password'
+      && /邀请票/.test(String(n.props.placeholder)));
+    ticketInput.props.onChange({ target: { value: 'relay1.test-ticket' } });
+    await tick();
+    const start = byType(tree10, 'button').find((b) => textOf(b) === '开通并连接');
+    start.props.onClick();
+    await tick();
+    assert.equal(posted10.length, 1);
+    assert.deepEqual(posted10[0], { action: 'start', ticket: 'relay1.test-ticket' });
+    h10.unmount();
+  });
+
+  await check('自建多用户中继：点击开通后立刻显示连接中，不等请求回来才有反馈', async () => {
+    const offPayload = withMulti({
+      enabled: false,
+      state: 'idle',
+      controlUrl: '',
+      publicHost: '',
+      url: null,
+      reconnectable: false,
+      lastError: null,
+      error: null,
+      errorCode: null,
+    });
+    await mount10(offPayload);
+    let resolveFetch = null;
+    const pending = new Promise((resolve) => { resolveFetch = resolve; });
+    setGlobal('fetch', async (url, init) => {
+      if (url === '/mini-remote/multi-relay' && init && init.method === 'POST') return pending;
+      return jsonResponse(200, offPayload);
+    });
+    const ticketInput = byType(tree10, 'input').find((n) => n.props.type === 'password');
+    ticketInput.props.onChange({ target: { value: 'relay1.pending' } });
+    await tick();
+    const start = byType(tree10, 'button').find((b) => textOf(b) === '开通并连接');
+    start.props.onClick();
+    await tick();
+    assert.ok(byType(tree10, 'button').some((b) => textOf(b) === '正在连接…'), '请求未回来时按钮要立刻变成正在连接');
+    assert.match(textOf(tree10), /正在开通或连接中/, '状态要立刻显示连接中');
+    resolveFetch(jsonResponse(200, runningMulti));
+    await tick();
+    assert.match(textOf(tree10), /已连接/, '请求成功后要变成已连接');
+    h10.unmount();
+  });
+
+  await check('自建多用户中继：清空本地配置要二次确认，确认后回到空白状态', async () => {
+    posted10 = [];
+    await mount10(runningMulti);
+    const reset = byType(tree10, 'button').find((b) => textOf(b) === '清空本地配置');
+    assert.ok(reset, '已配置时要有清空本地配置入口');
+    reset.props.onClick();
+    await tick();
+    assert.match(textOf(tree10), /不会删除服务器上的租户/, '清空前要说清服务端资源不删');
+    const confirm = byType(tree10, 'button').find((b) => textOf(b) === '确认清空');
+    assert.ok(confirm, '要有确认按钮');
+    confirm.props.onClick();
+    await tick();
+    assert.deepEqual(posted10, [{ action: 'reset' }]);
+    assert.equal(byType(tree10, 'input').some((n) => String(n.props.value).includes(MULTI_HOST)), false,
+      '清空后不再显示旧固定地址');
+    assert.ok(byType(tree10, 'input').some((n) => n.props.type === 'password' && String(n.props.placeholder).includes('邀请票')),
+      '清空后要回到可以粘贴邀请票的空白状态');
+    assert.match(textOf(tree10), /未开启/);
+    h10.unmount();
+  });
+
+}
+
+// 4e. Tailscale 的 HTTPS 地址：开关、状态、以及「tailnet 没开 Serve」那条路
+{
+  const withServe = (serve, extra) => Object.assign({
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    // **故意不给 tunnel**：给了页面上就会有两个复选框（公网一个、HTTPS 一个），
+    // 下面按顺序取第一个会抓到公网那个。少给一块，这里就只剩一个复选框，
+    // 「抓对了没有」不再是个变量。两块同时在的顺序另有一条专门测。
+    tunnel: null,
+    serve,
+  }, extra || {});
+
+  let tree7 = null;
+  let posted7 = [];
+  // 这次 POST 返回什么，由每条用例自己定——失败那条路要回的是 serve 自己的形状
+  // （带 reason 和 enableLink），不是配对信息。
+  let postReply = null;
+  let serveBox = () => [];
+
+  // **每条用例一套全新的状态单元。** 脚手架的 `draw()` 只把 `cursor` 归零，
+  // 不清 `cells`——所以上一条用例里「开开关失败了」留下的错误会一直挂在后面
+  // 每一条上。2026-09-25 就是这么撞上的：一条用例本该只有一条链接，却数出两条。
+  // 真机上不会这样（面板每次加载都是干净的），是脚手架复用了同一个组件实例。
+  const mount7 = async (payload) => {
+    const h = useHarness();
+    posted7 = [];
+    h.onUpdate(() => { tree7 = h.draw(Comp); });
+    serveBox = () => byType(tree7, 'input').filter((n) => n.props.type === 'checkbox');
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') {
+        posted7.push({ url, body: JSON.parse(init.body) });
+        return jsonResponse(200, postReply);
+      }
+      return jsonResponse(200, payload);
+    });
+    tree7 = h.draw(Comp);
+    h.runEffects();
+    await tick();
+    await expandSettingsGroup(tree7, 'external');
+    await expandExternalSubs(() => tree7);
+  };
+
+  await check('HTTPS 没开时：开关未选中，并说清楚开了能换来什么', async () => {
+    await mount7(withServe({ installed: true, on: false, url: null, urlOfOtherPort: null, error: null }));
+    const text = textOf(tree7);
+    assert.match(text, /HTTPS 地址（Tailscale）/);
+    // 光说「没开」没用，得说清楚**开了能换来什么**，否则用户没理由去开它。
+    // 换来的是"连接加密"（地址栏上那把 https 的锁）——**不要再写通知和麦克风**：
+    // 那两样我们都没实现（通知入口 2026-09-25 起藏着，麦克风图标已移除），
+    // 2026-09-27 用户指出这是拿不存在的功能招揽。
+    assert.match(text, /加密/);
+    assert.match(text, /https/i);
+    assert.doesNotMatch(text, /通知|麦克风/);
+    // 还要说清楚它和上面那条明文 Tailscale 是同一台电脑，不是第四条路
+    assert.match(text, /同一台电脑/);
+  });
+
+  await check('HTTPS 开着时：开关选中，并指向面板上那条加密地址', async () => {
+    await mount7(withServe({
+      installed: true, on: true, url: 'https://x.ts.net/', urlOfOtherPort: null, error: null,
+    }));
+    const text = textOf(tree7);
+    assert.match(text, /已开启/);
+    assert.match(text, /「Tailscale（加密）」/, '要告诉用户上面哪一条是它');
+  });
+
+  await check('serve 配着但指的是别的端口：说清楚，不能含糊成「没开」', async () => {
+    // 含糊成「没开」的话，用户会以为是自己这台电脑不支持，然后放弃。
+    await mount7(withServe({
+      installed: true, on: false, url: null, urlOfOtherPort: 'https://x.ts.net/', error: null,
+    }));
+    const text = textOf(tree7);
+    assert.match(text, /指的是别的端口/);
+    assert.doesNotMatch(text, /^没开/, '不能只说没开');
+  });
+
+  await check('没装 Tailscale 时：开关禁用，别让人点了没反应', async () => {
+    await mount7(withServe({ installed: false, on: false, url: null, urlOfOtherPort: null, error: null }));
+    const text = textOf(tree7);
+    assert.match(text, /没装 Tailscale/);
+    assert.equal(serveBox().length, 1);
+    assert.equal(serveBox()[0].props.disabled, true, '装都没装，开关该是灰的');
+  });
+
+  // 这条是整块界面上最要紧的一条。tailnet 没开 Serve 是整个功能里门槛最高的一步，
+  // 而 Tailscale 官方把开启链接印在报错里了——把它原样递给用户，他点一下就完事。
+  // 界面上如果只显示一句「失败了」，用户就卡死在这里。
+  await check('tailnet 没开 Serve：报错要说明白，并且把开启链接做成可点的', async () => {
+    postReply = {
+      ok: false,
+      reason: 'tailnet',
+      error: 'Tailscale 的 Serve 功能还没在这个账号上打开。点下面这条链接开一下，然后回来再试一次。',
+      enableLink: 'https://login.tailscale.com/f/serve?node=nKZqMyw1VE11CNTRL',
+    };
+    await mount7(withServe({ installed: true, on: false, url: null, urlOfOtherPort: null, error: null }));
+    serveBox()[0].props.onChange({ target: { checked: true } });
+    await tick();
+
+    assert.equal(posted7.length, 1);
+    assert.equal(posted7[0].url, '/mini-remote/serve');
+    assert.deepEqual(posted7[0].body, { enabled: true });
+
+    const text = textOf(tree7);
+    assert.match(text, /Serve 功能还没在这个账号上打开/);
+    const links = byType(tree7, 'a').filter((n) => String(n.props.href).includes('login.tailscale.com'));
+    assert.equal(links.length, 1, '开启链接必须真的渲染成一个可点的链接');
+    assert.equal(links[0].props.href, 'https://login.tailscale.com/f/serve?node=nKZqMyw1VE11CNTRL');
+  });
+
+  // 下面三条测的是「还没走完这一关的人，面板上能看到什么」。
+  //
+  // 起因是用户 2026-09-25 提的问题：这插件不是给一个人用的，别人上手之后，
+  // 插件能不能自动带他走完这一步？不能（那是 tailnet 级、要浏览器会话的授权）。
+  // 那就必须**在点开关之前**就把该去哪儿说清楚，而不是等他点了、等十几秒、
+  // 失败了才知道。服务端早就算出了那两条链接，是界面把它们丢掉了。
+  await check('serve 没开、但报错里有开启链接时：不用点开关就先给出来', async () => {
+    await mount7(withServe({
+      installed: true,
+      on: false,
+      url: null,
+      urlOfOtherPort: null,
+      error: null,
+      enableLink: 'https://login.tailscale.com/f/serve?node=nKZqMyw1VE11CNTRL',
+    }));
+    const links = byType(tree7, 'a').filter((n) => String(n.props.href).includes('/f/serve'));
+    assert.equal(links.length, 1, '还没点开关，这条链接就该在了');
+    assert.equal(links[0].props.href, 'https://login.tailscale.com/f/serve?node=nKZqMyw1VE11CNTRL');
+    assert.match(textOf(tree7), /插件代不了你点/, '要说清楚这一步得他自己在浏览器里点');
+  });
+
+  await check('装了但没登录：说的是「没登录」，并且给出登录链接', async () => {
+    // 合成一句「没开」的话，一个还没登录的人会反复点开关——怎么点都不会有反应，
+    // 因为手机要连的那个地址，是登录之后才存在的。
+    await mount7(withServe({
+      installed: true,
+      on: false,
+      url: null,
+      urlOfOtherPort: null,
+      error: 'Tailscale 装了，但这个账号还没登录。',
+      needsLogin: true,
+      loginUrl: 'https://login.tailscale.com/a/abc123def456',
+    }));
+    const text = textOf(tree7);
+    assert.match(text, /还没登录/);
+    assert.doesNotMatch(text, /^没开/, '不能含糊成「没开」');
+    const links = byType(tree7, 'a').filter((n) => String(n.props.href).includes('login.tailscale.com'));
+    assert.equal(links.length, 1);
+    assert.equal(links[0].props.href, 'https://login.tailscale.com/a/abc123def456');
+    assert.equal(serveBox()[0].props.disabled, true, '登录之前点开关没有意义，该是灰的');
+  });
+
+  await check('状态问不出来时：原文照登，不假装成「没开」', async () => {
+    await mount7(withServe({
+      installed: true,
+      on: false,
+      url: null,
+      urlOfOtherPort: null,
+      error: '问不出来 Tailscale serve 的现状。',
+    }));
+    assert.match(textOf(tree7), /问不出来/);
+  });
+
+  await check('成功开启后：面板换成新状态，开关变选中', async () => {
+    postReply = withServe({
+      installed: true, on: true, url: 'https://x.ts.net/', urlOfOtherPort: null, error: null,
+    });
+    await mount7(withServe({ installed: true, on: false, url: null, urlOfOtherPort: null, error: null }));
+    serveBox()[0].props.onChange({ target: { checked: true } });
+    await tick();
+    assert.match(textOf(tree7), /已开启/);
+  });
+
+  await check('整块面板报错时，HTTPS 开关仍然露得出来', async () => {
+    // 和公网那条同理：tailnet 没开 Serve 的时候，面板上其它东西多半也在报错，
+    // 而那正是用户最需要看到那条开启链接的时候。
+    await mount7(withServe(
+      { installed: true, on: false, url: null, urlOfOtherPort: null, error: null },
+      { ok: false, error: '没找到手机能连上的地址。', entries: undefined },
+    ));
+    assert.match(textOf(tree7), /HTTPS 地址（Tailscale）/);
+    assert.equal(serveBox().length, 1);
+  });
+
+  await check('公网和 HTTPS 两块同时出现时，HTTPS 排在公网后面', async () => {
+    // 顺序是有意的：三条连接路径（内网 / Tailscale / 公网）先说完，
+    // 再补一句 Tailscale 那条路还能换成加密的。反过来的话用户会以为
+    // HTTPS 是第四条路，而它其实只是同一条路上的一个开关。
+    await mount7(withServe(
+      { installed: true, on: false, url: null, urlOfOtherPort: null, error: null },
+      { tunnel: { enabled: false, up: false, starting: false, error: null } },
+    ));
+    const text = textOf(tree7);
+    assert.ok(
+      text.indexOf('公网访问') < text.indexOf('HTTPS 地址（Tailscale）'),
+      'HTTPS 那一块该排在公网后面',
+    );
+
+    assert.equal(serveBox().length, 3, '快速隧道、A 中继、HTTPS 各有一个开关');
+  });
+}
+
+// 4f. 飞书那一块：开关、两个凭据、两个名单，以及「被挡下的来源」那一行
+{
+  const withFeishu = (feishu, extra) => Object.assign({
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    // **故意不给 tunnel / serve**：那两块也各有一个复选框，这里少给两块，
+    // 「抓到的复选框是飞书那个」就不再是个变量。
+    tunnel: null,
+    serve: null,
+    feishu,
+  }, extra || {});
+
+  const FEISHU = {
+    enabled: true,
+    appId: 'cli_0123456789abcdef',
+    openIds: 'ou_me',
+    chatIds: '',
+    hasSecret: true,
+    starting: false,
+    running: true,
+    connected: true,
+    rejected: null,
+    error: null,
+  };
+
+  let tree8 = null;
+  let posted8 = [];
+  /** POST 那条要回什么；undefined = 照常回整份配对信息。 */
+  let postReply8;
+
+  // 这一块里的按钮不止一个（密码那一块也叫「保存」），所以先按标题框出这一块，
+  // 再在块内找——按文案在全树里找会抓到别人家的按钮。
+  const feishuSel = () => {
+    const block = walk(tree8).find((n) => n && n.props && n.props.key === 'feishu');
+    assert.ok(block, '面板上该有飞书那一块');
+    const inputs = byType(block, 'input');
+    return {
+      block,
+      text: textOf(block),
+      box: inputs.filter((n) => n.props.type === 'checkbox'),
+      password: inputs.find((n) => n.props.type === 'password'),
+      save: byType(block, 'button').find((b) => /^保存/.test(textOf(b))),
+    };
+  };
+
+  const mount8 = async (payload, expand = true) => {
+    const h = useHarness();
+    posted8 = [];
+    postReply8 = undefined;
+    h.onUpdate(() => { tree8 = h.draw(Comp); });
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') {
+        posted8.push({ url, body: JSON.parse(init.body) });
+        return jsonResponse(200, postReply8 === undefined ? payload : postReply8);
+      }
+      return jsonResponse(200, payload);
+    });
+    tree8 = h.draw(Comp);
+    h.runEffects();   // 读配对信息
+    await tick();     // 信息到了 → 重渲染，rerun 一次让草稿填进来
+    h.runEffects();
+    await tick();
+    if (expand) await expandSettingsGroup(tree8, 'feishu');
+  };
+
+  await check('飞书默认关着：开关未选中，两个名单空着时给出「怎么拿到自己 id」的那条路', async () => {
+    await mount8(withFeishu(Object.assign({}, FEISHU, {
+      enabled: false, running: false, connected: false, hasSecret: false, appId: '', openIds: '',
+    })), false);
+    const collapsed = walk(tree8).find((n) => n && n.props && n.props.key === 'group-feishu');
+    assert.ok(collapsed, '飞书组要在');
+    assert.equal(byType(collapsed, 'input').filter((n) => n.props.type === 'checkbox').length, 0,
+      '默认收起：飞书开关和表单不摊在页面上');
+    assert.ok(byType(collapsed, 'button').some((b) => textOf(b) === '展开'), '收起时保留展开入口');
+    await expandSettingsGroup(tree8, 'feishu');
+    const sel = feishuSel();
+    assert.equal(sel.box.length, 1, '这一块该有一个开关');
+    assert.equal(sel.box[0].props.checked, false, '默认是关的，不许自己偷偷连出去');
+    assert.match(sel.text, /没开/);
+    // 名单默认是空的（谁都不认），用户不可能凭空知道自己的 open_id 长什么样：
+    // 面板必须当场告诉他「发一句 → 回这一页刷新 → 抄进来」这条流程。
+    assert.match(sel.text, /刷新/, '要写清楚怎么把来源 id 弄出来');
+    assert.match(sel.text, /open_id/);
+    // 后台那几步（该订阅哪个事件之类）全在收起的那份指引里，上面这一行只负责指路。
+    assert.match(sel.text, /指引/, '要告诉用户后台那些步骤在哪儿看');
+  });
+
+  await check('appSecret 是密码框，而且永远不回填（存过了也不显示）', async () => {
+    await mount8(withFeishu(FEISHU));
+    const sel = feishuSel();
+    assert.ok(sel.password, '凭据那一格该是打码的');
+    assert.equal(sel.password.props.value, '', '服务端不把 appSecret 送回来，这格就该是空的');
+    assert.match(sel.password.props.placeholder, /留空/, '已经存过一份时要说明「留空 = 不动它」');
+  });
+
+  await check('没改动时保存按钮是禁用的（反馈靠禁用态，不发「已保存」）', async () => {
+    await mount8(withFeishu(FEISHU));
+    const sel = feishuSel();
+    assert.ok(sel.save, '这一块要有一个保存按钮');
+    assert.equal(sel.save.props.disabled, true, '没改东西就没什么可存的');
+  });
+
+  await check('勾上开关就能存：POST /mini-remote/feishu，凭据框空着就不发 appSecret', async () => {
+    await mount8(withFeishu(Object.assign({}, FEISHU, { enabled: false })));
+    feishuSel().box[0].props.onChange({ target: { checked: true } });
+    await tick();
+    assert.equal(feishuSel().save.props.disabled, false, '改了东西就该能存');
+    feishuSel().save.props.onClick();
+    await tick();
+    assert.equal(posted8.length, 1);
+    assert.equal(posted8[0].url, '/mini-remote/feishu');
+    assert.equal(posted8[0].body.enabled, true);
+    assert.equal(posted8[0].body.openIds, 'ou_me', '名单要一起存上去');
+    assert.ok(!('appSecret' in posted8[0].body), '留空 = 不动原来那份，别拿空串把凭据覆盖掉');
+  });
+
+  await check('填了凭据才发上去，而且发完那一格要清空', async () => {
+    await mount8(withFeishu(FEISHU));
+    feishuSel().password.props.onChange({ target: { value: 'brand-new-secret' } });
+    await tick();
+    feishuSel().save.props.onClick();
+    await tick();
+    assert.equal(posted8[0].body.appSecret, 'brand-new-secret', '只有真填了才发上去');
+    assert.equal(feishuSel().password.props.value, '', '存进去之后就别再摆在页面上了');
+  });
+
+  await check('被挡下的来源照登到面板上（含 open_id 原值）', async () => {
+    // 这一行是整个配置流程能不能自己走通的关键：名单默认是空的，用户第一次发消息
+    // 必然被挡，那时把他的 open_id 印出来，他才抄得进去。
+    await mount8(withFeishu(Object.assign({}, FEISHU, {
+      rejected: { reason: '来源不在白名单：open_id=ou_stranger、chat_id=oc_abc', at: 1 },
+    })));
+    const text = feishuSel().text;
+    assert.match(text, /ou_stranger/, '原值要照登，不许加工');
+    assert.match(text, /oc_abc/);
+  });
+
+  await check('配置指引默认收起：按钮在，六步正文一个字都不在页面上', async () => {
+    await mount8(withFeishu(Object.assign({}, FEISHU, { enabled: false })));
+    const text = feishuSel().text;
+    assert.match(text, /配置指引/, '飞书这一块里要有那份指引的开关');
+    assert.match(text, /六步/, '要写明是「飞书后台六步」，不然用户不知道这是给谁看的');
+    assert.match(text, /首次配置需在飞书开放平台完成六步。/, '收起时留一句事实性摘要，让人知道展开后是什么');
+    // 按只可能出现在正文里的句子查，不按「事件与回调」这种别处也提过的词查。
+    assert.doesNotMatch(text, /仅我可见/, '默认收起：正文不该摊在页面上');
+    assert.doesNotMatch(text, /im:message:receive_as_bot/);
+    assert.doesNotMatch(text, /添加应用能力/, '漏加机器人能力这一步也在正文里，收起时同样不该出现');
+    assert.doesNotMatch(text, /不要把机器人拉进群/);
+  });
+
+  await check('点开配置指引：六步与注意事项在场；再点一次收回去', async () => {
+    await mount8(withFeishu(Object.assign({}, FEISHU, { enabled: false })));
+    const guideBtn = () => byType(feishuSel().block, 'button').find((b) => /配置指引/.test(textOf(b)));
+    const closeBtn = () => byType(feishuSel().block, 'button').find((b) => /收起配置指引/.test(textOf(b)));
+
+    guideBtn().props.onClick();
+    await tick();
+    const text = feishuSel().text;
+    assert.doesNotMatch(text, /首次配置需在飞书开放平台完成六步。/, '展开之后那句摘要收起来，正文上场');
+    assert.match(text, /事件与回调/, '第二步要说清在哪儿设成长连接');
+    assert.match(text, /添加应用能力/, '建应用那一步要写清去哪里加机器人能力，漏了这步飞书里搜不到机器人');
+    assert.match(text, /漏了这步，飞书里搜不到它/, '漏加的后果要写在动作旁边，不能只说「要加」');
+    assert.match(text, /im\.message\.receive_v1/, '订阅哪个事件是最容易漏的一步');
+    assert.match(text, /im:message:receive_as_bot/);
+    assert.match(text, /仅我可见/);
+    assert.match(text, /不要把机器人拉进群/, '注意事项也在这一份里');
+    assert.ok(closeBtn(), '点开之后按钮要变成「收起」');
+
+    // 下面这几组钉的是 2026-10 实机跑通之后补进去的坑：每一条都对应一个具体动作或一个判断标志，
+    // 改文案时不许把它们悄悄丢掉。判断标志（0→3、那条通知、那句灰字）是最省字也最经用的一类
+    // 句子，删了用户就不知道自己到底做对了没有。
+    assert.match(text, /搜索框只填 im\.message 这半段/, '权限页只搜半个 scope 名，是这个功能卡人最久的一步');
+    assert.match(text, /带上后面的 :receive_as_bot 会搜出 0 条/, '要写清带上哪一段会搜不到，否则用户还是会连后半段一起搜');
+    assert.match(text, /「应用身份权限」（另一个标签「用户身份权限」不用管）/, '说清三项在哪一档，顺带把另一个标签排掉');
+    assert.match(text, /从 0 变成 3，就是勾对了/, '判断标志：勾全了才从 0 变 3');
+    assert.match(text, /im\.message\.receive_v1 是事件，在第 4 步那个列表里配，权限页搜不到它/,
+      '事件和权限是两个页面，这个混法最耽误时间');
+
+    assert.match(text, /都要重新发布一次才生效，不发布一切不生效/, '改了不重新发布等于白改');
+    assert.match(text, /「开发者小助手」会推给你一条通知（应用审批通过／已发布成功）/, '发布生效的可见信号，得说清去哪儿看');
+    assert.match(text, /收到就是生效了/, '判断标志之二');
+    assert.match(text, /企业里配了审批就得等管理员通过/, '有审批的企业里这一步会卡住，要提前说');
+
+    // 第 5 步整段的行为在 2026-10 变了：不再让用户回电脑上抄 id，插件直接在飞书里回他一句。
+    assert.match(text, /第一次一定被挡下（两份名单都留空时谁都不认）/, '第一次被挡是设计的一部分，不说清用户会以为配错了');
+    assert.match(text, /插件会直接在飞书里回你一句/, '新路子：编号在飞书里当场给，不用回电脑上翻');
+    assert.match(text, /你的编号告诉你/);
+    assert.match(text, /open_id=ou_xxxxx/, '第 8 步要和插件在飞书里真回的那句话对得上');
+    assert.match(text, /可能还带个 chat_id=oc_xxxxx/, 'chat_id 是「可能有」，不能写成一定有');
+    assert.match(text, /照着它回的那句填就行，不用再回电脑上看/);
+    assert.match(text, /填进「允许的 open_id」那一格（chat_id 可以留空）/);
+    assert.match(text, /App Secret 那一格保存后会自动清空/, '密钥不回显，不说清用户会以为自己把它删掉了');
+    assert.match(text, /留空就不改动它/, '判断标志之三：那句灰字是「存上了」的唯一凭据');
+    assert.match(text, /留空保存 = 不动原来那份/);
+
+    assert.match(text, /回答是整段一次回来的/, '整段回 = 要等一会儿，不预告用户会以为卡死了');
+    assert.match(text, /回答落进手机页当前绑定的那个会话/, '回答落到哪个会话，是用户必然会问的第一个问题');
+    assert.match(text, /回答末尾另起一行「会话：<标题>」/, '回答出自哪个会话，现在靠这行标记，指引得说清它在哪儿');
+    assert.match(text, /取不到名字时写「未命名会话」/, '兜底文案要对得上 lib/lark.js 的 SESSION_TAG_FALLBACK');
+    assert.doesNotMatch(text, /这块还没做/, '这功能已经做了，别留旧说法');
+    assert.match(text, /机器人同时只处理一轮/);
+
+    assert.match(text, /群里被挡时不会回那句话（只对单聊回）/,
+      '那句提示只发给单聊，群里的人等不到——不写清楚会以为插件坏了');
+
+    closeBtn().props.onClick();
+    await tick();
+    assert.doesNotMatch(feishuSel().text, /仅我可见/, '再点一次就该收回去');
+    assert.doesNotMatch(feishuSel().text, /搜索框只填 im\.message/, '收起来之后新补的这些也不该留在页面上');
+  });
+
+  await check('保存失败时留一行，写清是哪一环', async () => {
+    await mount8(withFeishu(Object.assign({}, FEISHU, { enabled: false })));
+    postReply8 = 'not an object';
+    feishuSel().box[0].props.onChange({ target: { checked: true } });
+    await tick();
+    feishuSel().save.props.onClick();
+    await tick();
+    assert.match(feishuSel().text, /保存飞书配置失败：服务返回了 HTTP 200。/, '失败要说清是哪一步');
+  });
+
+  await check('整块面板报错时，飞书这一块仍然露得出来', async () => {
+    // 它是一条独立的通路，手机服务起没起来都不该拦着用户改它。
+    await mount8(withFeishu(Object.assign({}, FEISHU, { enabled: false }), {
+      ok: false, error: '没找到手机能连上的地址。', entries: undefined,
+    }));
+    assert.match(feishuSel().text, /飞书/);
+    assert.equal(feishuSel().box.length, 1);
+  });
+}
+
+// 4f. 设备那一块（2026-10-16 第三步）：列出 / 改名 / 撤销（撤销要二次确认）
+{
+  console.log('\n[4f] 设备名单（列出 / 改名 / 撤销）');
+
+    const DEV_A = {
+    id: 'a'.repeat(32),
+    name: '妈妈那台',
+    kind: 'phone',
+    createdAt: localMs(16, 6, 20),
+    lastSeen: localMs(16, 6, 25),
+  };
+  // 老记录（第三步之前写下的）没有 lastSeen：界面上要说「还没有记录」，**不许凭空编一个时间**。
+  const DEV_B = {
+    id: 'b'.repeat(32), name: '客厅的旧手机', kind: 'phone',
+    createdAt: localMs(16, 6, 20), lastSeen: 0,
+  };
+
+  const PAIRING_OK = {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: { enabled: false, up: false, starting: false, error: null },
+  };
+
+  /**
+   * 挂一次这一节：GET /mini-remote/devices 回名单，两条动作按顺序回执。
+   * `listReplies` 是**依次**回给「列名单」那几次 GET 的（改名/撤销之后都会重新列一次）。
+   */
+  const mountDevices = async (listReplies, actionReply) => {
+    const hh = useHarness();
+    const state = { gets: [], posts: [], tree: null };
+    let listAt = 0;
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') {
+        state.posts.push({ url, body: JSON.parse(init.body) });
+        return jsonResponse(200, actionReply(state.posts.length));
+      }
+      state.gets.push(url);
+      if (url === '/mini-remote/devices') {
+        const reply = listReplies[Math.min(listAt, listReplies.length - 1)];
+        listAt += 1;
+        return jsonResponse(200, reply);
+      }
+      return jsonResponse(200, PAIRING_OK);
+    });
+    hh.onUpdate(() => { state.tree = hh.draw(Comp); });
+    state.tree = hh.draw(Comp);
+    hh.runEffects();   // 读配对信息
+    await tick();
+    hh.runEffects();   // 配对信息到了 → 读设备名单
+    await tick();
+    await expandSettingsGroup(state.tree, 'computers');
+    await expandDevices(state.tree);
+    return state;
+  };
+
+  /**
+   * 设备那一块的渲染树。**按 key 找，不按位置也不按文案**：上面还有二维码、密码、
+   * 尾插、飞书那几块，位置会变；而 key='devices' 是这一块自己的记号。
+   */
+  const devicesBlockOf = (tree) => walk(tree).find((n) => n && n.props && n.props.key === 'devices');
+
+  /** 设备默认收起：现有用例都先展开再查名单，避免把“折叠”当成“没有设备”。 */
+  const expandDevices = async (tree) => {
+    const block = devicesBlockOf(tree);
+    const button = block && byType(block, 'button').find((b) => textOf(b) === '展开');
+    if (!button) return;
+    button.props.onClick();
+    await tick();
+  };
+
+  const twoDevices = { ok: true, devices: [DEV_A, DEV_B] };
+
+  await check('名单到了就摆出来：名字、类型、创建时间、最近使用时间，一格不缺', async () => {
+    const st = await mountDevices([twoDevices], () => ({ ok: true }));
+    const text = textOf(st.tree);
+    assert.match(text, /妈妈那台/);
+    assert.match(text, /客厅的旧手机/);
+    assert.match(text, /手机/, '类型要写出来（这一版只有手机）');
+    assert.match(text, /创建于 2026-10-16 06:20/, '创建时间要说清是哪一刻');
+    assert.match(text, /最近使用 2026-10-16 06:25/);
+    // 老记录没有这个字段：说「还没有记录」，不许拿创建时间顶上（那是凭空造一次使用）。
+    assert.match(text, /最近使用 还没有记录/);
+    assert.doesNotMatch(text, /NaN|undefined|Invalid Date/);
+  });
+
+  await check('另一台电脑（kind: "desktop"）：类型那格说人话，不是原样打印 desktop', async () => {
+    const st = await mountDevices(
+      [{ ok: true, devices: [Object.assign({}, DEV_A, { kind: 'desktop' }), DEV_B] }],
+      () => ({ ok: true }),
+    );
+    const text = textOf(devicesBlockOf(st.tree));
+    assert.match(text, /另一台电脑/, '跨机配对进来的那台要说人话');
+    assert.doesNotMatch(text, /desktop/, '内部的 kind 值不该原样摆到用户眼前');
+    assert.match(text, /客厅的旧手机/, '同一张名单里别的设备照旧');
+  });
+
+  await check('每台两个动作：「改名」和「撤销」', async () => {
+    const st = await mountDevices([twoDevices], () => ({ ok: true }));
+    const buttons = byType(devicesBlockOf(st.tree), 'button');
+    assert.equal(buttons.filter((b) => textOf(b) === '改名').length, 2);
+    assert.equal(buttons.filter((b) => textOf(b) === '撤销').length, 2);
+  });
+
+  await check('点「改名」：就地变成输入框，原名字填在里面（不弹窗、不跳页）', async () => {
+    const st = await mountDevices([twoDevices], () => ({ ok: true }));
+    const first = byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '改名')[0];
+    first.props.onClick();
+    await tick();
+    const inputs = byType(devicesBlockOf(st.tree), 'input').filter((n) => n.props.type === 'text');
+    assert.equal(inputs.length, 1, '一次只编辑一台');
+    assert.equal(inputs[0].props.value, '妈妈那台');
+    assert.equal(byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '保存').length, 1);
+  });
+
+  await check('改完点「保存」：POST 改名那条（带 id 和新名字），然后**重新列一次**', async () => {
+    const st = await mountDevices(
+      [twoDevices, { ok: true, devices: [Object.assign({}, DEV_A, { name: '新名字' }), DEV_B] }],
+      () => ({ ok: true, device: Object.assign({}, DEV_A, { name: '新名字' }) }),
+    );
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '改名')[0].props.onClick();
+    await tick();
+    const input = byType(devicesBlockOf(st.tree), 'input').filter((n) => n.props.type === 'text')[0];
+    input.props.onChange({ target: { value: '新名字' } });
+    await tick();
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '保存')[0].props.onClick();
+    await tick();
+    await tick();
+    assert.deepEqual(st.posts, [{ url: '/mini-remote/devices/rename', body: { id: DEV_A.id, name: '新名字' } }]);
+    assert.equal(st.gets.filter((u) => u === '/mini-remote/devices').length, 2,
+      '改完必须再列一次：屏幕上那份要来自服务端，不是我们以为改成了什么');
+    assert.match(textOf(st.tree), /新名字/);
+  });
+
+  await check('点「撤销」**什么都不发**：只把后果摊在那一行下面（说的就是"要重新扫码"）', async () => {
+    const st = await mountDevices([twoDevices], () => ({ ok: true }));
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '撤销')[0].props.onClick();
+    await tick();
+    assert.deepEqual(st.posts, [], '第一下不许把设备撤掉——一次点击就造成的后果太重了');
+    const text = textOf(devicesBlockOf(st.tree));
+    assert.match(text, /撤销后，这台设备要重新扫码才能再用。/, '确认框里要说清后果');
+    assert.equal(byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '确认撤销').length, 1);
+    assert.equal(byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '取消').length, 1);
+  });
+
+  await check('点「确认撤销」才真发：POST 撤销那条，成功之后那一行消失（重新列过）', async () => {
+    const st = await mountDevices(
+      [twoDevices, { ok: true, devices: [DEV_B] }],
+      () => ({ ok: true, id: DEV_A.id, dropped: 1 }),
+    );
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '撤销')[0].props.onClick();
+    await tick();
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '确认撤销')[0].props.onClick();
+    await tick();
+    await tick();
+    assert.deepEqual(st.posts, [{ url: '/mini-remote/devices/revoke', body: { id: DEV_A.id } }]);
+    assert.equal(st.gets.filter((u) => u === '/mini-remote/devices').length, 2);
+    const text = textOf(devicesBlockOf(st.tree));
+    assert.doesNotMatch(text, /妈妈那台/, '撤销掉的那台要从名单上消失');
+    assert.match(text, /客厅的旧手机/, '别的设备一样都不许动');
+  });
+
+  await check('「取消」之后什么也不发生（那一行还在，弹出来的后果收回去）', async () => {
+    const st = await mountDevices([twoDevices], () => ({ ok: true }));
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '撤销')[0].props.onClick();
+    await tick();
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '取消')[0].props.onClick();
+    await tick();
+    assert.deepEqual(st.posts, []);
+    // 按**按钮**判，不按那句话判：这一块的说明里本来就写着"撤销之后那台设备要重新扫码"
+    // （那一句常驻），所以拿文案去查"确认框收起来了没有"是查不出来的。
+    const buttons = byType(devicesBlockOf(st.tree), 'button').map(textOf);
+    assert.ok(!buttons.includes('确认撤销'), '取消之后不该还留着"确认撤销"');
+    assert.equal(buttons.filter((b) => b === '撤销').length, 2, '两台的「撤销」都回到原位');
+    assert.match(textOf(devicesBlockOf(st.tree)), /妈妈那台/);
+  });
+
+  await check('一台设备都没有时：说清"还没有登记过的设备"，不摊一个空壳', async () => {
+    const st = await mountDevices([{ ok: true, devices: [] }], () => ({ ok: true }));
+    const block = devicesBlockOf(st.tree);
+    assert.ok(block, '这一块本身要在（它是"谁进得来"的账本）');
+    assert.match(textOf(block), /还没有登记过的设备/);
+  });
+
+  await check('名单读不到时：把那句原因照登出来，不吞', async () => {
+    const hh = useHarness();
+    let tree = null;
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') return jsonResponse(200, { ok: true });
+      if (url === '/mini-remote/devices') return jsonResponse(404, { error: 'not found' });
+      return jsonResponse(200, PAIRING_OK);
+    });
+    hh.onUpdate(() => { tree = hh.draw(Comp); });
+    tree = hh.draw(Comp);
+    hh.runEffects();
+    await tick();
+    hh.runEffects();
+    await tick();
+    await expandSettingsGroup(tree, 'computers');
+    assert.match(textOf(tree), /读设备名单失败/, '读不到要说出来，不能假装"一台都没有"');
+  });
+
+  await check('动作失败时：服务端那句原因原样摆在那一块里（不谎报成功）', async () => {
+    const st = await mountDevices(
+      [twoDevices],
+      () => ({ ok: false, error: '这台设备已经不在名册里了，刷新看看。' }),
+    );
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '撤销')[0].props.onClick();
+    await tick();
+    byType(devicesBlockOf(st.tree), 'button').filter((b) => textOf(b) === '确认撤销')[0].props.onClick();
+    await tick();
+    await tick();
+    assert.match(textOf(devicesBlockOf(st.tree)), /已经不在名册里了/);
+  });
+}
+
+// 4g. 「允许别的电脑连接」那一节（2026-10-16 跨机第二步）
+{
+  console.log('\n[4g] 允许别的电脑连接（跨机那个开关）');
+
+  // 这一节的 payload。**故意不给 tunnel / serve / feishu**：别的块多一个复选框，
+  // 下面按顺序取第一个就会抓错——少给几块，这里就只剩跨机这一个（照 4e 那条）。
+  const withRemote = (remote, extra) => Object.assign({
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: null,
+    serve: null,
+    feishu: null,
+    remote,
+  }, extra || {});
+
+  let tree = null;
+  let posted = [];
+  let postReply = null;
+  let infoReply = null;
+  const h = useHarness();
+  h.onUpdate(() => { tree = h.draw(Comp); });
+
+  const mount = async (payload) => {
+    posted = [];
+    infoReply = payload;
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') {
+        posted.push({ url, body: JSON.parse(init.body) });
+        // 服务端回的仍是整份配对信息（真机就是这样的）：开关那一格按这次请求翻转。
+        return jsonResponse(200, withRemote(
+          { allowed: JSON.parse(init.body).enabled },
+          { devices: [] },
+        ));
+      }
+      if (url === '/mini-remote/devices') return jsonResponse(200, { ok: true, devices: [] });
+      return jsonResponse(200, postReply ?? infoReply);
+    });
+    postReply = null;
+    tree = h.draw(Comp);
+    h.runEffects();
+    await tick();
+    const computers = walk(tree).find((n) => n && n.props && n.props.key === 'group-computers');
+    if (computers) await expandSettingsGroup(tree, 'computers');
+    return tree;
+  };
+
+  /** 这一块的渲染树。**按 key 找**（上面还有二维码、密码那几块，位置会变）。 */
+  const remoteBlockOf = (t) => walk(t).find((n) => n && n.props && n.props.key === 'remote');
+
+  await check('默认关：开关未选中，并说清"连配对也不受理"', async () => {
+    await mount(withRemote({ allowed: false }));
+    const block = remoteBlockOf(tree);
+    assert.ok(block, '这一块要出现（服务端给了 remote 就有得渲染）');
+    const boxes = byType(block, 'input').filter((n) => n.props.type === 'checkbox');
+    assert.equal(boxes.length, 1, '就一个开关');
+    assert.equal(boxes[0].props.checked, false, '默认是关的');
+    const text = textOf(block);
+    assert.match(text, /允许别的电脑连接/);
+    assert.match(text, /未开启（默认）/, '要写明这是默认状态');
+    assert.match(text, /配对请求也不受理/, '"关"是一个整体状态，得说清它关的是什么');
+  });
+
+  await check('开着时：选中，并且把那句风险摆出来（那台电脑拿到的是完整界面）', async () => {
+    await mount(withRemote({ allowed: true }));
+    const block = remoteBlockOf(tree);
+    const boxes = byType(block, 'input').filter((n) => n.props.type === 'checkbox');
+    assert.equal(boxes[0].props.checked, true);
+    const text = textOf(block);
+    assert.match(text, /完整界面/, '用户很可能以为"只是看个窗口"，这一句必须说出来');
+    assert.match(text, /只给你信得过的电脑开/);
+    assert.match(text, /名单里把它撤销/, '关掉的办法要指到下面那份名单上');
+  });
+
+  await check('点开关 → POST /mini-remote/remote-access，body 是 {enabled}', async () => {
+    await mount(withRemote({ allowed: false }));
+    const box = byType(remoteBlockOf(tree), 'input').filter((n) => n.props.type === 'checkbox')[0];
+    box.props.onChange({ target: { checked: true } });
+    await tick();
+    assert.deepEqual(posted, [{ url: '/mini-remote/remote-access', body: { enabled: true } }],
+      '存的是这一个开关，地址和 body 都写死在这里');
+    // 服务端回的那一份说了算：界面不许自己先把开关画成开着的
+    const after = byType(remoteBlockOf(tree), 'input').filter((n) => n.props.type === 'checkbox')[0];
+    assert.equal(after.props.checked, true, '存完拿服务端那份刷新');
+  });
+
+  await check('服务端没给 remote 字段时：整块不出现（不摆一个空壳）', async () => {
+    const payload = withRemote(undefined);
+    delete payload.remote;
+    await mount(payload);
+    assert.equal(remoteBlockOf(tree), undefined, '没有这一格就不画这一块');
+  });
+
+  await check('它排在设备名单前面（同一件事的两半：许不许连 / 已经连了谁）', async () => {
+    await mount(withRemote({ allowed: false }));
+    // 名单要等配对信息到了之后才拉，所以再来一轮（照 4f 那个夹具）
+    h.runEffects();
+    await tick();
+    const nodes = walk(tree);
+    const at = (key) => nodes.findIndex((n) => n && n.props && n.props.key === key);
+    assert.ok(at('remote') >= 0, '总开关要在');
+    assert.ok(at('devices') >= 0, '设备名单也要在');
+    assert.ok(at('remote') < at('devices'), '总开关要排在名单前面');
+  });
+}
+
+// 4h. 「其他电脑」那一块（2026-10-16 跨机第三步的界面）：列出 / 添加 / 打开那一屏 / 断开
+{
+  console.log('\n[4h] 其他电脑（列出 / 添加 / 打开那一屏 / 断开）');
+
+    const FAR = {
+    id: 'f'.repeat(32),
+    name: '书房那台',
+    baseUrl: 'http://192.168.1.9:19387',
+    addedAt: localMs(16, 7, 5),
+    lastOk: localMs(16, 7, 8),
+  };
+  // 老记录没有 lastOk（刚加进来还没换过票）：界面上说「还没有记录」，**不许编一个时间**。
+  const OLD = {
+    id: 'e'.repeat(32), name: '', baseUrl: 'http://100.92.105.99:19387',
+    addedAt: localMs(16, 7, 5), lastOk: 0,
+  };
+  /** 宿主换回来的那条地址（真机上是 `http://<对面>/mini/mirror/?ticket=…`）。 */
+  const REMOTE_TICKET = 'http://192.168.1.9:19387/mini/mirror/?ticket=one-shot-remote';
+  const LOCAL_TICKET = 'http://127.0.0.1:3090/mini/mirror/?ticket=one-shot-local';
+  /** 宿主把对面的 401 翻成 502 之后带回来的那句话（lib/index.js 的 REMOTE_REVOKED_HINT）。 */
+  const REVOKED_HINT = '那台电脑已经不认这枚凭据了——多半是它那边把这条记录撤销了。\n'
+    + '要重新连，得拿那台电脑的口令在这儿重新添加一次。';
+
+  const PAIRING_SIMPLE = {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: null,
+    selfRelay: {
+      enabled: false, running: false, connected: false, url: '', error: null,
+      frpcPath: '', version: '', configured: false, serverAddr: '',
+      serverPort: 443, publicHost: '', transport: 'wss',
+    },
+  };
+
+  // 「整屏显示别的电脑」要两样东西：官方布局服务的把手（`ctx.layout.selectPanel`）和设置页
+  // 外壳递进来的 `close`（真机上是 `renderSlot("settings.section", { close })`）。照真机搭。
+  const layoutCalls = [];
+  let closedSettings = 0;
+  const docListeners = [];
+  setGlobal('document', {
+    addEventListener: (type, fn) => { docListeners.push({ type, fn }); },
+    removeEventListener: () => {},
+  });
+  const fakeLayout = {
+    selectPanel: (id) => { layoutCalls.push(id); },
+    panelInfo: {
+      getSnapshot: () => ({ activePanelId: 'conversation' }),
+      subscribe: () => () => {},
+    },
+  };
+  mod.apply({
+    // `ctx.inject` 递进来的是一个 scope（真机上它带 effect）：照它给 layout 和 effect。
+    inject: (names, callback) => callback({
+      layout: fakeLayout,
+      effect: (fn) => { const off = fn(); return () => { if (typeof off === 'function') off(); }; },
+    }),
+    effect: (fn) => { const off = fn(); return () => { if (typeof off === 'function') off(); }; },
+    slots: { inject: (name, callback) => callback(), register: () => () => {} },
+  });
+  const settingsProps = { close: () => { closedSettings += 1; } };
+
+  /**
+   * 把一轮「点击 → 发请求 → 回执 → 重画」走完。
+   *
+   * 一次 `tick()`（setImmediate）会把这之前排着的微任务排干，但这一条链子有五六跳
+   * （fetch → json → 认回执 → 存状态 → 通知 → 重画），两跳经常只走到一半——那样断言
+   * 看到的是**上一轮**的结果，测试会莫名其妙地"差一条"。多走几步最省事。
+   */
+  const settle = async () => { for (let i = 0; i < 6; i += 1) await tick(); };
+
+  /**
+   * 挂一次这一节：`GET /mini-remote/remotes` 依次回 `listReplies`，POST 交给 `actionReply`
+   * （`{ url, body, n }` → 响应；给 `jsonResponse(...)` 原样用，给普通对象当 200 的回执；
+   * 返回 rejected promise 就是"网络层失败"）。
+   */
+  const mountRemotes = async (listReplies, actionReply) => {
+    const hh = useHarness();
+    const state = { gets: [], posts: [], tree: null, harness: hh };
+    let listAt = 0;
+    setGlobal('fetch', async (url, init) => {
+      if (init && init.method === 'POST') {
+        const body = JSON.parse(init.body || '{}');
+        state.posts.push({ url, body });
+        const rep = await Promise.resolve(actionReply({ url, body, n: state.posts.length }));
+        return (rep && typeof rep.json === 'function') ? rep : jsonResponse(200, rep);
+      }
+      state.gets.push(url);
+      if (url === '/mini-remote/remotes') {
+        const reply = listReplies[Math.min(listAt, listReplies.length - 1)];
+        listAt += 1;
+        return jsonResponse(reply.status, reply.body);
+      }
+      if (url === '/mini-remote/devices') return jsonResponse(200, { ok: true, devices: [] });
+      return jsonResponse(200, PAIRING_SIMPLE);
+    });
+    hh.onUpdate(() => { state.tree = hh.draw(Comp, settingsProps); });
+    state.tree = hh.draw(Comp, settingsProps);
+    hh.runEffects();   // 读配对信息
+    await tick();
+    hh.runEffects();   // 配对信息到了 → 读设备名单 + 读「其他电脑」
+    await tick();
+    await expandSettingsGroup(state.tree, 'computers');
+    return state;
+  };
+
+  /** 这一块的渲染树。**按 key 找**（上面还有二维码、密码、设备那几块，位置会变）。 */
+  const remotesBlockOf = (tree) => walk(tree).find((n) => n && n.props && n.props.key === 'remotes');
+  /** 某台电脑那一行。**按它的 id 找**（行自己的 key 就是 id），不按位置也不按名字。 */
+  const rowOf = (tree, id) => walk(remotesBlockOf(tree)).find((n) => n && n.props && n.props.key === id);
+  const buttonIn = (node, label) => byType(node, 'button').find((b) => textOf(b) === label);
+  /**
+   * 那一整屏（main 槽里那个面板）单独拉一次，看它画了什么。
+   *
+   * 返回的是一个**可变的盒子**：重画之后 `box.tree` 跟着变。（`const { tree } =` 解构出来的
+   * 是点之前那一棵树，点完再去读它就会读到旧的——这个坑已经踩过一次。）
+   */
+  const drawPanel = async () => {
+    const hh = useHarness();
+    const box = { tree: null, harness: hh };
+    hh.onUpdate(() => { box.tree = hh.draw(entryOf('main').Comp); });
+    box.tree = hh.draw(entryOf('main').Comp);
+    hh.runEffects();
+    await settlePanel();
+    return box;
+  };
+  const listOf = (remotes) => [{ status: 200, body: { ok: true, remotes: remotes } }];
+  const fresh = () => { layoutCalls.length = 0; closedSettings = 0; };
+
+  await check('名单到了就摆出来：名字、地址、最近成功时间，一格不缺', async () => {
+    const st = await mountRemotes(listOf([FAR, OLD]), () => ({ ok: true }));
+    const text = textOf(remotesBlockOf(st.tree));
+    assert.match(text, /书房那台/);
+    assert.match(text, /http:\/\/192\.168\.1\.9:19387/, '地址要摆出来（用户要拿它和对面核对）');
+    assert.match(text, /最近成功 2026-10-16 07:08/, '要说清"最近一次成功"是哪一刻');
+    assert.match(text, /最近成功 还没有记录/, '没成功过就说还没有记录，不编一个时间');
+    assert.match(text, /（这台电脑没有名字）/, '名字空着（用地址当名字时也可能为空）也要有个说法');
+    assert.doesNotMatch(text, /NaN|undefined|Invalid Date/);
+    st.harness.unmount();
+  });
+
+  await check('每台两个动作：「重连」和「断开」（就是用户要的那两个）', async () => {
+    const st = await mountRemotes(listOf([FAR]), () => ({ ok: true }));
+    assert.deepEqual(byType(rowOf(st.tree, FAR.id), 'button').map(textOf), ['重连', '断开']);
+    st.harness.unmount();
+  });
+
+  await check('点「重连」→ POST /mini-remote/remotes/window（带上那一台的 id）', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => ({ ok: true, url: REMOTE_TICKET, expiresIn: 30 }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    assert.deepEqual(st.posts, [{ url: '/mini-remote/remotes/window', body: { id: FAR.id } }],
+      '「重连」= 再取一次票，地址和 body 都写死在这里');
+    st.harness.unmount();
+  });
+
+  await check('取到票就把"那一整屏"打开：切到远程窗口 + **关掉设置页**', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => ({ ok: true, url: REMOTE_TICKET, expiresIn: 30 }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    assert.deepEqual(layoutCalls, ['mini-remote'], '要切到 main 槽里我们那个 key');
+    assert.equal(closedSettings, 1,
+      '设置页是盖在界面上的浮层：不关掉它，切过去的那一屏还在它后面，用户看到的是"点了没反应"');
+    st.harness.unmount();
+  });
+
+  await check('点那一行本身也算（不用非得点「重连」）；点在按钮上则不算', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => ({ ok: true, url: REMOTE_TICKET, expiresIn: 30 }));
+    // 点在行里的按钮上：那是「断开」那一片，不该顺手去取票。
+    rowOf(st.tree, FAR.id).props.onClick({ target: { closest: () => ({}) } });
+    await settle();
+    assert.deepEqual(st.posts, [], '点在按钮上不算"点这一行"');
+    // 点在行的空白处（target 不是一个按钮）：走取票那一条。
+    rowOf(st.tree, FAR.id).props.onClick({ target: { closest: () => null } });
+    await settle();
+    assert.equal(st.posts.length, 1);
+    assert.equal(st.posts[0].url, '/mini-remote/remotes/window');
+    st.harness.unmount();
+  });
+
+  await check('那一屏：把票的地址交给框，而且**不去要本机那张票**', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), ({ url }) => (url === '/mini-remote/window'
+      ? { ok: true, url: LOCAL_TICKET, expiresIn: 30 }
+      : { ok: true, url: REMOTE_TICKET, expiresIn: 30 }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    const p = await drawPanel();
+    const iframe = byType(p.tree, 'iframe')[0];
+    assert.ok(iframe, '票到手了就该把框立起来');
+    assert.equal(iframe.props.src, REMOTE_TICKET);
+    assert.doesNotMatch(iframe.props.src, /[?&]token=/,
+      '框的地址里**不许出现令牌**——那会留在打开这台电脑的人的浏览历史里');
+    assert.ok(!st.posts.some((one) => one.url === '/mini-remote/window'),
+      '选了别的电脑就不该再去要本机那一张票（那会白换一张，本机拿不出界面时还会平白报错）');
+    p.harness.unmount();
+    st.harness.unmount();
+  });
+
+  await check('票过了寿命也**不再自己重取**：地址不变 ⇒ 框不重载（"去掉定时换票"的看门人）', async () => {
+    // ⚠️ **反向验证的靶子**：把"面板按票的寿命再换一张"加回去（那个 effect + 新鲜度判据），
+    //    这一条立刻变红——它会多出 POST，而且框的地址被换掉（真机上那就是整屏重载一次）。
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), ({ url }) => (url === '/mini-remote/remotes/window'
+      ? { ok: true, url: REMOTE_TICKET, expiresIn: 0 }   // expiresIn 0 = 宿主说这张票已经过期了
+      : { ok: true, url: LOCAL_TICKET, expiresIn: 30 }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    assert.equal(st.posts.length, 1, '开这一台只换一次票');
+    const p = await drawPanel();
+    const iframe = byType(p.tree, 'iframe')[0];
+    assert.ok(iframe, '票一到手就把地址交给框：**不再看它的寿命**（票在框第一次加载那一下就已经用掉了）');
+    const firstSrc = iframe.props.src;
+    assert.equal(firstSrc, REMOTE_TICKET);
+    // 真机上这一屏的外壳一直在重画；面板被重挂也是常事（切走再切回来）。
+    // **地址必须一直是同一条**——变一次，框就整个重载一次。
+    await drawPanel();
+    await drawPanel();
+    assert.equal(byType(p.tree, 'iframe')[0].props.src, firstSrc,
+      '**地址不许变**：一变，用户正在看的那台电脑的界面就整屏重载一遍');
+    assert.equal(st.posts.length, 1, '面板自己不许再换第二张票（票只在"开这一台"那一刻换）');
+    p.harness.unmount();
+    st.harness.unmount();
+  });
+
+  await check('宿主迟迟不回话：到点（15 秒）就说人话 + 「再试一次」+「← 返回列表」，**不许一直转**', async () => {
+    fresh();
+    // 这一趟的取票请求**永远不回话**（宿主卡住）。把 setTimeout 换成能手动点的，
+    // 免得这个用例真等 15 秒。
+    const timers = [];
+    const realSetTimeout = globalThis.setTimeout;
+    setGlobal('setTimeout', (fn, ms) => { timers.push({ fn, ms }); return timers.length; });
+    try {
+      const st = await mountRemotes(listOf([FAR]), () => new Promise(() => {}));
+      buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+      await settle();
+      assert.match(textOf(rowOf(st.tree, FAR.id)), /取票中/, '还没到点：那一行照实说正在取票');
+      const waited = timers.find((one) => one.ms === 15000);
+      assert.ok(waited, '取票那一条必须**自己带一个超时**（15 秒；宿主那一半自己只有 8 秒上限）');
+      waited.fn();   // 到点
+      await settle();
+      // ⚠️ 顺序要紧：**先在设置页那一套状态上看**，再 `drawPanel()`——后者会把替身 React 的
+      //    "当前状态单元"切到面板那一套上（见 ReactFacade 那段注释）。
+      const rowText = textOf(rowOf(st.tree, FAR.id));
+      assert.match(rowText, /等了 15 秒还没等到/, '设置页那一行照登同一句话（人还留在刚才点的地方）');
+      assert.doesNotMatch(rowText, /取票中/, '超时之后不许还挂着"取票中"');
+      const p = await drawPanel();
+      const text = textOf(p.tree);
+      assert.match(text, /等了 15 秒还没等到/, '超时要有一句**人话**（说清是"等不到回话"，不是别的事）');
+      assert.doesNotMatch(text, /正在向那台电脑换一张通行证/,
+        '**不许停在"正在换票…"上**——那就是转不完的圈（前车之鉴：502 让外壳永远停在 Loading plugins…）');
+      assert.ok(buttonIn(p.tree, '再试一次'), '要给人下一步');
+      assert.match(text, /← 返回列表/, '顶上那条出口一直都在（出错也不是死胡同）');
+      assert.equal(byType(p.tree, 'iframe').length, 0, '没换到票就别立框');
+      // 「再试一次」是一条真出路：它再取一次票，而且**又带上了那个超时**。
+      const before = st.posts.length;
+      buttonIn(p.tree, '再试一次').props.onClick();
+      await settle();
+      assert.equal(st.posts.length, before + 1, '「再试一次」就是再取一次票');
+      assert.ok(timers.filter((one) => one.ms === 15000).length >= 2, '新的一趟照样自己带超时');
+      // 收尾：把这一趟也判成超时落地。**这一步是必须的**——跨机那几样状态在组件外面
+      // （模块级），留着一条"永远不回话、还挂在取票中"的请求，后面的用例会看见它。
+      timers.filter((one) => one.ms === 15000).pop().fn();
+      await settle();
+      p.harness.unmount();
+      st.harness.unmount();
+    } finally {
+      setGlobal('setTimeout', realSetTimeout);
+    }
+  });
+
+  await check('被对面撤销了：那一行写成「这台电脑已经被对方撤销了，要重新配对」+ 宿主原话', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => jsonResponse(502, { ok: false, error: REVOKED_HINT }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    const text = textOf(rowOf(st.tree, FAR.id));
+    assert.match(text, /这台电脑已经被对方撤销了，要重新配对/,
+      '用户下一步该做的是重新配对，这一行必须这么说');
+    assert.match(text, /已经不认这枚凭据/, '宿主那两行原话照登（里面写着拿口令重新添加）');
+    assert.doesNotMatch(text, /正在向那台电脑换一张通行证|取票中/,
+      '**不能停在"取票中"**——那就是"转不完的圈"（前车之鉴：502 让外壳永远停在 Loading plugins…）');
+    assert.equal(layoutCalls.length, 0, '票没换到就别把人送到那一屏去');
+    assert.equal(closedSettings, 0, '票没换到，设置页不许关（那句话得让人看得见）');
+    st.harness.unmount();
+  });
+
+  await check('别的 502（对面没开那个开关）：照原话，**不许**说成"被撤销了"', async () => {
+    fresh();
+    const said = '那台电脑说：这台电脑没有允许别的电脑连接。要连的话，先在这台电脑的设置里打开「允许别的电脑连接」。';
+    const st = await mountRemotes(listOf([FAR]), () => jsonResponse(502, { ok: false, error: said }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    const text = textOf(rowOf(st.tree, FAR.id));
+    assert.match(text, /没有允许别的电脑连接/, '宿主写好的那句话原样转述');
+    assert.doesNotMatch(text, /已经被对方撤销了/, '别的错不能被认成"对面撤销了"——那会让人白配一次对');
+    st.harness.unmount();
+  });
+
+  await check('连不上那台电脑：也要有一句人话（不是空白，也不是一直转）', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => Promise.reject(new Error('fetch failed')));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    const text = textOf(rowOf(st.tree, FAR.id));
+    assert.match(text, /连不上这台电脑上的遥控服务/);
+    assert.doesNotMatch(text, /正在向那台电脑换一张通行证|取票中/);
+    st.harness.unmount();
+  });
+
+  await check('那一屏没开成时：**一句人话 + 一个「再试一次」**，不是空白框', async () => {
+    fresh();
+    // 第一次取票失败（设置页点的那一次），第二次（「再试一次」）才换成。
+    // **面板自己不会再去试第二次**——那一趟只由用户的动作发起（2026-10-17 起，见 client.js 里那段）。
+    const st = await mountRemotes(listOf([FAR]), ({ n }) => (n <= 1
+      ? jsonResponse(502, { ok: false, error: REVOKED_HINT })
+      : { ok: true, url: REMOTE_TICKET, expiresIn: 30 }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    const p = await drawPanel();
+    assert.match(textOf(p.tree), /这台电脑已经被对方撤销了，要重新配对/);
+    assert.match(textOf(p.tree), /已经不认这枚凭据/);
+    assert.match(textOf(p.tree), /再试一次/, '要给人一个下一步');
+    assert.equal(byType(p.tree, 'iframe').length, 0, '没换到票就别立框');
+    buttonIn(p.tree, '再试一次').props.onClick();
+    await settle();
+    assert.equal(st.posts.length, 2, '「再试一次」就是再取一次票');
+    assert.equal(byType(p.tree, 'iframe')[0].props.src, REMOTE_TICKET, '这次换到了，框就立起来');
+    p.harness.unmount();
+    st.harness.unmount();
+  });
+
+  await check('换另一台失败时，那一屏**不许**接着放上一台的界面', async () => {
+    fresh();
+    const B = Object.assign({}, FAR, { id: 'b'.repeat(32), name: '客厅那台' });
+    const st = await mountRemotes(listOf([FAR, B]), ({ body }) => (body.id === FAR.id
+      ? { ok: true, url: REMOTE_TICKET, expiresIn: 30 }
+      : jsonResponse(502, { ok: false, error: '连不上那台电脑' })));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    buttonIn(rowOf(st.tree, B.id), '重连').props.onClick();
+    await settle();
+    const p = await drawPanel();
+    assert.equal(byType(p.tree, 'iframe').length, 0,
+      '刚点的那台没换成票，屏幕上出现上一台的界面是最坏的一种错（用户不知道自己在看谁）');
+    assert.match(textOf(p.tree), /连不上那台电脑/);
+    p.harness.unmount();
+    st.harness.unmount();
+  });
+
+  await check('点「断开」**什么都不发**：只把后果摊在那一行下面（说清对面还留着）', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => ({ ok: true }));
+    buttonIn(rowOf(st.tree, FAR.id), '断开').props.onClick();
+    await settle();
+    assert.deepEqual(st.posts, [], '第一下不许真断开');
+    const text = textOf(rowOf(st.tree, FAR.id));
+    assert.match(text, /断开之后，这台电脑就不再连它了/);
+    assert.match(text, /对面那台电脑上还留着/, '断开的语义是"这台电脑不管它了"，不是"收回了对面的权限"');
+    assert.ok(buttonIn(rowOf(st.tree, FAR.id), '确认断开'));
+    assert.ok(buttonIn(rowOf(st.tree, FAR.id), '取消'));
+    st.harness.unmount();
+  });
+
+  await check('点「取消」：那一行回到原样，断开没发生', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => ({ ok: true }));
+    buttonIn(rowOf(st.tree, FAR.id), '断开').props.onClick();
+    await settle();
+    buttonIn(rowOf(st.tree, FAR.id), '取消').props.onClick();
+    await settle();
+    assert.deepEqual(st.posts, []);
+    assert.ok(!buttonIn(rowOf(st.tree, FAR.id), '确认断开'));
+    assert.match(textOf(rowOf(st.tree, FAR.id)), /书房那台/);
+    st.harness.unmount();
+  });
+
+  await check('点「确认断开」才真发：POST 断开那条，成功之后重列名单 + 把宿主那句话摆出来', async () => {
+    fresh();
+    const NOTE = '已经从这台电脑的列表里移除了，本地存的那枚凭据也一起删了。\n'
+      + '那台电脑上还留着「这台电脑」那条记录——要彻底收回，得去它的「遥控设置」页里撤销那一台。';
+    const st = await mountRemotes(
+      [listOf([FAR])[0], { status: 200, body: { ok: true, remotes: [] } }],
+      ({ url }) => (url === '/mini-remote/remotes/forget' ? { ok: true, id: FAR.id, note: NOTE } : { ok: true }),
+    );
+    buttonIn(rowOf(st.tree, FAR.id), '断开').props.onClick();
+    await settle();
+    buttonIn(rowOf(st.tree, FAR.id), '确认断开').props.onClick();
+    await settle();
+    assert.deepEqual(st.posts, [{ url: '/mini-remote/remotes/forget', body: { id: FAR.id } }]);
+    assert.equal(st.gets.filter((u) => u === '/mini-remote/remotes').length, 2,
+      '断完必须再列一次：屏幕上那份要来自服务端');
+    const text = textOf(remotesBlockOf(st.tree));
+    assert.doesNotMatch(text, /书房那台/, '断开的那台要从名单上消失');
+    assert.match(text, /这台电脑还没连过别的电脑/);
+    assert.match(text, /要彻底收回，得去它的「遥控设置」页里撤销那一台/,
+      '宿主那句"对面还留着"要原样摆出来（最容易留下的误会）');
+    st.harness.unmount();
+  });
+
+  await check('点「添加一台电脑」：摊开两个输入框（地址、口令）+ 一个可选的名字', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([]), () => ({ ok: true }));
+    buttonIn(remotesBlockOf(st.tree), '添加一台电脑').props.onClick();
+    await settle();
+    const inputs = byType(remotesBlockOf(st.tree), 'input');
+    assert.equal(inputs.length, 3, '地址 + 口令 + 名字（名字可留空）');
+    assert.deepEqual(inputs.map((n) => n.props.type), ['text', 'password', 'text'],
+      '口令那一格必须打码');
+    assert.match(textOf(remotesBlockOf(st.tree)), /遥控设置」-连接方式内复制【密码】/,
+      '口令说明要指到「遥控设置 → 连接方式」里的密码');
+    assert.ok(buttonIn(remotesBlockOf(st.tree), '确认添加'));
+    st.harness.unmount();
+  });
+
+  await check('框空着点「确认添加」：当场说清，一个请求都不发', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([]), () => ({ ok: true }));
+    buttonIn(remotesBlockOf(st.tree), '添加一台电脑').props.onClick();
+    await settle();
+    buttonIn(remotesBlockOf(st.tree), '确认添加').props.onClick();
+    await settle();
+    assert.deepEqual(st.posts, []);
+    assert.match(textOf(remotesBlockOf(st.tree)), /要填那台电脑的地址/);
+    // 只填地址、口令空着：也要当场说清（口令是这一步唯一必须要的东西）。
+    let inputs = byType(remotesBlockOf(st.tree), 'input');
+    inputs[0].props.onChange({ target: { value: 'https://192.168.1.9:19387' } });
+    await settle();
+    buttonIn(remotesBlockOf(st.tree), '确认添加').props.onClick();
+    await settle();
+    assert.deepEqual(st.posts, []);
+    assert.match(textOf(remotesBlockOf(st.tree)), /要填那台电脑的口令/);
+    inputs = byType(remotesBlockOf(st.tree), 'input');
+    assert.equal(inputs[0].props.value, 'https://192.168.1.9:19387', '当场说清之后，用户打的字还在');
+    st.harness.unmount();
+  });
+
+  await check('填好点「确认添加」（**一次确认**）→ POST 添加那条，成功之后重列名单、收起表单', async () => {
+    fresh();
+    const st = await mountRemotes(
+      [{ status: 200, body: { ok: true, remotes: [] } }, { status: 200, body: { ok: true, remotes: [FAR] } }],
+      () => ({ ok: true, remote: FAR }),
+    );
+    buttonIn(remotesBlockOf(st.tree), '添加一台电脑').props.onClick();
+    await settle();
+    let inputs = byType(remotesBlockOf(st.tree), 'input');
+    inputs[0].props.onChange({ target: { value: 'https://192.168.1.9:19387' } });
+    await settle();
+    inputs = byType(remotesBlockOf(st.tree), 'input');
+    inputs[1].props.onChange({ target: { value: TOKEN } });
+    await settle();
+    inputs = byType(remotesBlockOf(st.tree), 'input');
+    inputs[2].props.onChange({ target: { value: '书房那台' } });
+    await settle();
+    buttonIn(remotesBlockOf(st.tree), '确认添加').props.onClick();
+    await settle();
+    assert.deepEqual(st.posts, [{
+      url: '/mini-remote/remotes/add',
+      body: { name: '书房那台', baseUrl: 'https://192.168.1.9:19387', token: TOKEN },
+    }]);
+    assert.equal(st.gets.filter((u) => u === '/mini-remote/remotes').length, 2);
+    assert.match(textOf(remotesBlockOf(st.tree)), /书房那台/, '加完那一台就在名单上');
+    assert.ok(!buttonIn(remotesBlockOf(st.tree), '确认添加'), '加完表单收起来');
+    st.harness.unmount();
+  });
+
+  await check('添加失败时：把对面那句话原样摆出来，而且**表单还开着**（不丢用户打的字）', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([]), () => jsonResponse(502, { ok: false, error: '那台电脑说：口令不对。' }));
+    buttonIn(remotesBlockOf(st.tree), '添加一台电脑').props.onClick();
+    await settle();
+    let inputs = byType(remotesBlockOf(st.tree), 'input');
+    inputs[0].props.onChange({ target: { value: 'https://192.168.1.9:19387' } });
+    await settle();
+    inputs = byType(remotesBlockOf(st.tree), 'input');
+    inputs[1].props.onChange({ target: { value: '错的口令' } });
+    await settle();
+    buttonIn(remotesBlockOf(st.tree), '确认添加').props.onClick();
+    await settle();
+    const text = textOf(remotesBlockOf(st.tree));
+    assert.match(text, /口令不对/, '失败要说清是谁说的哪一句');
+    const after = byType(remotesBlockOf(st.tree), 'input');
+    assert.equal(after.length, 3, '失败之后表单不许自己收起来——用户打的那些字还在里面');
+    assert.equal(after[0].props.value, 'https://192.168.1.9:19387');
+    st.harness.unmount();
+  });
+
+  // —— 地址的协议校验（2026-10-18）：`http://` 能配对、能取票，但打开那一屏是白的。
+  // 所以在"填地址"这一步就拦下来，把原因说在源头。依据见那份跨站嵌入调研报告。
+  {
+    /** 填一对地址+口令、点确认、回状态（`posts` 能看出有没有真的发出去）。 */
+    const tryAdd = async (baseUrl) => {
+      fresh();
+      const st = await mountRemotes(listOf([]), () => ({ ok: true, id: 'x'.repeat(32) }));
+      buttonIn(remotesBlockOf(st.tree), '添加一台电脑').props.onClick();
+      await settle();
+      let inputs = byType(remotesBlockOf(st.tree), 'input');
+      inputs[0].props.onChange({ target: { value: baseUrl } });
+      await settle();
+      inputs = byType(remotesBlockOf(st.tree), 'input');
+      inputs[1].props.onChange({ target: { value: TOKEN } });
+      await settle();
+      buttonIn(remotesBlockOf(st.tree), '确认添加').props.onClick();
+      await settle();
+      return st;
+    };
+
+    await check('填非回环的 http:// 地址：当场拒绝，而且一个请求都不发', async () => {
+      const st = await tryAdd('http://192.168.1.9:19387');
+      const text = textOf(remotesBlockOf(st.tree));
+      assert.match(text, /要用 https:\/\//, '要说清该填什么');
+      assert.match(text, /白/, '还要说清后果——不说的话用户不知道为什么不能用');
+      assert.equal(st.posts.length, 0, '被拦下的地址不许发出去：发出去就等于让用户点开看白屏');
+      st.harness.unmount();
+    });
+
+    await check('填 http://127.0.0.1（回环）：放行——浏览器把回环当可信来源', async () => {
+      const st = await tryAdd('http://127.0.0.1:3090');
+      assert.equal(st.posts.length, 1, '回环地址该照常发出去（本机自测那条路要用它）');
+      assert.equal(st.posts[0].body.baseUrl, 'http://127.0.0.1:3090');
+      st.harness.unmount();
+    });
+
+    await check('填 https://（Tailscale 那种）：放行', async () => {
+      const st = await tryAdd('https://desktop-example.tail0000.ts.net');
+      assert.equal(st.posts.length, 1);
+      st.harness.unmount();
+    });
+
+    await check('填没带协议的地址（192.168.1.9:3090）：当场说清要带协议', async () => {
+      const st = await tryAdd('192.168.1.9:3090');
+      assert.match(textOf(remotesBlockOf(st.tree)), /要以 http:\/\/ 或 https:\/\/ 开头/);
+      assert.equal(st.posts.length, 0);
+      st.harness.unmount();
+    });
+
+    await check('填别的协议（ftp://）：拒绝', async () => {
+      const st = await tryAdd('ftp://192.168.1.9');
+      assert.match(textOf(remotesBlockOf(st.tree)), /只支持 http:\/\/ 和 https:\/\//);
+      assert.equal(st.posts.length, 0);
+      st.harness.unmount();
+    });
+  }
+
+  await check('名单读不到时：把那句原因照登出来，不说成"还没连过别的电脑"', async () => {
+    fresh();
+    const st = await mountRemotes([{ status: 404, body: { ok: false, error: 'not found' } }], () => ({ ok: true }));
+    const text = textOf(remotesBlockOf(st.tree));
+    assert.match(text, /读「其他电脑」名单失败/);
+    assert.match(text, /重启一次 DSH 再试/, '接口都没有（宿主是旧版）时，下一步只有一句话：重启');
+    assert.doesNotMatch(text, /这台电脑还没连过别的电脑/, '读不到 ≠ 一台都没有');
+    st.harness.unmount();
+  });
+
+  await check('再点一下侧栏那一条：在某一台的界面里 → 退回**名单**（还在这一屏里）；名单上再点 → 退出', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([FAR]), () => ({ ok: true, url: REMOTE_TICKET, expiresIn: 30 }));
+    buttonIn(rowOf(st.tree, FAR.id), '重连').props.onClick();
+    await settle();
+    const onDocClick = docListeners.filter((one) => one.type === 'click').pop();
+    assert.ok(onDocClick, '「再点一下」那一下要挂上');
+    fakeLayout.panelInfo.getSnapshot = () => ({ activePanelId: 'mini-remote' });
+
+    // ① 人在**某一台的界面**里：这一下是退回名单，**不许**把人送出这一屏。
+    const onScreen = await drawPanel();
+    assert.ok(byType(onScreen.tree, 'iframe'), '先确认人在那一台的界面里');
+    const atPanel = layoutCalls.length;   // 上面设置页那一下已经切过面板了，从这儿往后数
+    onDocClick.fn({
+      target: { closest: () => ({ querySelector: () => ({}) }) },
+      stopPropagation: () => {},
+    });
+    assert.equal(layoutCalls.length, atPanel, '这一下只上一层：不许切面板');
+    const onList = await drawPanel();
+    // 2026-10-19 **保活**（同上）：退回名单不卸载那一屏，只藏起来。
+    assert.equal(byType(onList.tree, 'iframe').length, 1,
+      '保活：退回名单时那一屏留在 DOM 里，只是藏起来了');
+    assert.match(textOf(onList.tree), /书房那台/, '退回的是名单那一层');
+    onScreen.harness.unmount();
+    onList.harness.unmount();
+
+    // ② 人已经站在**名单**上：这一下才是退出（回到进来之前那一屏）。
+    onDocClick.fn({
+      target: { closest: () => ({ querySelector: () => ({}) }) },
+      stopPropagation: () => {},
+    });
+    assert.deepEqual(layoutCalls.slice(-1), ['conversation'],
+      '退出要回到进来之前那一屏（进来之前是会话）');
+    // 放下之后：再点开看到的是**名单**（不是刚才那一台，也不再是本机那一屏）。
+    const box = await drawPanel();
+    assert.equal(byType(box.tree, 'iframe').length, 0, '退出之后那一趟放下了：点开是名单');
+    assert.match(textOf(box.tree), /书房那台/);
+    box.harness.unmount();
+    st.harness.unmount();
+    fakeLayout.panelInfo.getSnapshot = () => ({ activePanelId: 'conversation' });
+  });
+
+  await check('自建中继的配置指引能展开', async () => {
+    fresh();
+    const st = await mountRemotes(listOf([]), () => ({ ok: true }));
+    await expandSettingsGroup(st.tree, 'external');
+    await expandExternalSubs(() => st.tree);
+    const selfBlock = () => walk(st.tree).find((n) => n && n.props && n.props.key === 'self-relay');
+    assert.match(textOf(selfBlock()), /未配置。展开后/, '自建中继默认收起');
+    const expandBtn = buttonIn(selfBlock(), '展开');
+    assert.ok(expandBtn, '自建中继要有展开按钮');
+    expandBtn.props.onClick();
+    await settle();
+    const guideBtn = buttonIn(selfBlock(), '配置指引（服务器 + 域名 + frpc）');
+    assert.ok(guideBtn, '自建中继末尾要有配置指引按钮');
+    guideBtn.props.onClick();
+    await settle();
+    assert.match(textOf(selfBlock()), /准备服务器和端口/, '点开之后要看到第一步');
+    assert.match(textOf(selfBlock()), /收起配置指引/, '按钮要变成收起');
+    const prompt = walk(selfBlock()).find((n) => n && n.type === 'textarea');
+    assert.ok(prompt, '第二种方法要提供可复制的提示词');
+    assert.match(prompt.props.value, /通过 SSH 登录服务器/);
+    assert.ok(buttonIn(selfBlock(), '复制提示词'), '提示词旁边要有复制按钮');
+    st.harness.unmount();
+  });
+}
+
+{
+  console.log('\n[4h] 自检（这台电脑到底在跑什么）');
+
+  // 时刻都用「本地时间构造 + 本地时间断言」：换一台时区的机器跑也照样对得上。
+  const AT = (d, h, m) => new Date(2026, 9, d, h, m, 0, 0).getTime();
+
+  const SELF_OK = {
+    ok: true,
+    version: '0.2.1',
+    process: { pid: 4321, startedAtMs: AT(17, 17, 16), startedAt: '2026-10-17T09:16:00.000Z', uptimeSec: 7200 },
+    code: { file: 'lib/index.js', modifiedAtMs: AT(17, 17, 10), stale: false, message: null },
+    routes: [
+      { path: '/mini-remote/pairing', kind: 'exact', mounted: true },
+      { path: '/mini-remote/token', kind: 'exact', mounted: true },
+      { path: '/mini-remote/selfcheck', kind: 'exact', mounted: true },
+    ],
+    allowRemoteComputers: false,
+    phoneService: {
+      listening: true, port: 3090, addresses: ['127.0.0.1', '192.168.1.5'], error: null,
+      hostHalf: { pair: true, remoteWindow: true },
+    },
+    dataDir: 'C:\\Users\\me\\.dsh\\dsh-everywhere',
+    rosters: { devices: 2, remotes: 0 },
+  };
+
+  const PAIRING_OK = {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: { enabled: false, up: false, starting: false, error: null },
+  };
+
+  /**
+   * 挂一次设置页那一节：自检那条按 `reply` 回，别的三条（配对 / 设备 / 其他电脑）
+   * 回空的。**和真机一样的顺序**：配对信息回来之后，那三条同一趟一起读。
+   */
+  const mountSelfcheck = async (reply) => {
+    const hh = useHarness();
+    const state = { gets: [], tree: null };
+    setGlobal('fetch', async (url) => {
+      state.gets.push(url);
+      if (url === '/mini-remote/selfcheck') {
+        return typeof reply === 'function' ? reply(state) : reply;
+      }
+      if (url === '/mini-remote/devices') return jsonResponse(200, { ok: true, devices: [] });
+      if (url === '/mini-remote/remotes') return jsonResponse(200, { ok: true, remotes: [] });
+      return jsonResponse(200, PAIRING_OK);
+    });
+    hh.onUpdate(() => { state.tree = hh.draw(Comp); });
+    state.tree = hh.draw(Comp);
+    hh.runEffects();      // 读配对信息
+    await tick();
+    hh.runEffects();      // 配对信息到了 → 设备 / 其他电脑 / 自检 同一趟
+    await tick();
+    await tick();
+    await expandSettingsGroup(state.tree, 'computers');
+    await expandSettingsGroup(state.tree, 'diagnostics');
+    state.harness = hh;
+    return state;
+  };
+
+  /** 自检那一块的渲染树：按 key 找，不按位置也不按文案。 */
+  const selfBlockOf = (tree) => walk(tree).find((n) => n && n.props && n.props.key === 'selfcheck');
+  const buttonIn = (tree, label) => byType(tree, 'button').filter((b) => textOf(b) === label)[0];
+
+  await check('挂上这一节就去读自检：GET /mini-remote/selfcheck（和配对/设备/其他电脑同一趟）', async () => {
+    const st = await mountSelfcheck(jsonResponse(200, SELF_OK));
+    assert.ok(st.gets.includes('/mini-remote/selfcheck'), '这一节没去读自检');
+    assert.ok(st.gets.indexOf('/mini-remote/selfcheck') > st.gets.indexOf('/mini-remote/pairing'),
+      '自检是在配对信息回来之后那一趟读的（和另外两条名单同一趟）');
+    st.harness.unmount();
+  });
+
+  await check('摘要一行说清：插件版本 · 进程何时起的 · 接口几条在', async () => {
+    const st = await mountSelfcheck(jsonResponse(200, SELF_OK));
+    const collapsed = textOf(selfBlockOf(st.tree));
+    assert.match(collapsed, /自检/);
+    assert.match(collapsed, /插件版本 0\.2\.1/);
+    assert.match(collapsed, /宿主进程启动于 2026-10-17 17:16/);
+    assert.match(collapsed, /接口一共 3 条，都在/);
+    // 默认收起：细节不许摊在页面上，点「展开自检」才出来
+    assert.doesNotMatch(collapsed, /插件文件最后改动于/, '默认收起：细节不该摊在页面上');
+    buttonIn(selfBlockOf(st.tree), '展开自检').props.onClick();
+    await tick();
+    const text = textOf(selfBlockOf(st.tree));
+    assert.match(text, /插件文件最后改动于：2026-10-17 17:10（lib\/index\.js）/);
+    assert.match(text, /「允许别的电脑连接」：关（默认关）/);
+    assert.match(text, /在听端口 3090，绑了 127\.0\.0\.1、192\.168\.1\.5/);
+    assert.match(text, /数据目录/);
+    assert.match(text, /dsh-everywhere/);
+    assert.match(text, /设备 2 条 · 我能连的电脑 0 条/);
+    assert.match(text, /\/mini-remote\/pairing/, '接口清单一列出来');
+    // 没有错的时候不许喊狼来了，但也得说清"是真的没有"，不是"读不到"。
+    assert.match(text, /最近没有出错记录。/);
+    assert.doesNotMatch(text, /最近出错 \d+ 条/);
+    assert.doesNotMatch(text, /NaN|undefined|Invalid Date/);
+    st.harness.unmount();
+  });
+
+  await check('一句人话的说明：这块只给本机看、里面没有密码', async () => {
+    const st = await mountSelfcheck(jsonResponse(200, SELF_OK));
+    const text = textOf(selfBlockOf(st.tree));
+    assert.match(text, /仅本机可读取，不包含密码或密钥。/);
+    st.harness.unmount();
+  });
+
+  await check('进程比代码旧：那句"重启 DSH"当场出现，而且**收起之后照样看得见**', async () => {
+    const stale = Object.assign({}, SELF_OK, {
+      code: {
+        file: 'lib/index.js',
+        modifiedAtMs: AT(17, 17, 40),
+        stale: true,
+        message: '这台电脑的插件可能不是最新的，重启 DSH 才会加载新版本。',
+      },
+      process: Object.assign({}, SELF_OK.process, { startedAtMs: AT(17, 17, 16) }),
+    });
+    const st = await mountSelfcheck(jsonResponse(200, stale));
+    // 默认就是收起态：**那句警告不许被藏起来**（要用户先点开才能看见，等于把它藏起来）
+    const collapsed = selfBlockOf(st.tree);
+    assert.match(textOf(collapsed), /这台电脑的插件可能不是最新的，重启 DSH 才会加载新版本。/,
+      '收起（默认）时那句话必须在');
+    assert.doesNotMatch(textOf(collapsed), /插件文件最后改动于/, '收起的是那些细节');
+    assert.match(textOf(collapsed), /接口/, '摘要那一行照旧在');
+    // 展开：细节出来
+    buttonIn(selfBlockOf(st.tree), '展开自检').props.onClick();
+    await tick();
+    assert.match(textOf(selfBlockOf(st.tree)), /插件文件最后改动于/, '展开之后细节要在');
+    // 再收起：警告照旧在
+    buttonIn(selfBlockOf(st.tree), '收起自检').props.onClick();
+    await tick();
+    assert.match(textOf(selfBlockOf(st.tree)), /这台电脑的插件可能不是最新的，重启 DSH 才会加载新版本。/,
+      '再收起之后那句警告还得在');
+    st.harness.unmount();
+  });
+
+  await check('接口清单里"现在不在"的那几条要标出来，摘要也说清几条不在', async () => {
+    const partial = Object.assign({}, SELF_OK, {
+      routes: [
+        { path: '/mini-remote/pairing', kind: 'exact', mounted: true },
+        { path: '/mini-remote/devices/revoke', kind: 'exact', mounted: false },
+      ],
+    });
+    const st = await mountSelfcheck(jsonResponse(200, partial));
+    buttonIn(selfBlockOf(st.tree), '展开自检').props.onClick();
+    await tick();
+    const text = textOf(selfBlockOf(st.tree));
+    assert.match(text, /接口一共 2 条，其中 1 条不在/);
+    assert.match(text, /\/mini-remote\/devices\/revoke/);
+    assert.match(text, /（现在不在）/);
+    st.harness.unmount();
+  });
+
+  await check('最近出错：摘要报条数、明细摆最新那一条，而且说清"不落盘"', async () => {
+    const withErrors = Object.assign({}, SELF_OK, {
+      errors: [
+        { at: AT(17, 17, 30), kind: 'remote', message: '连不上那台电脑（http://127.0.0.1:1）：ECONNREFUSED。' },
+        { at: AT(17, 17, 20), kind: 'tunnel', message: '公网访问没起来：cloudflared 找不到。' },
+      ],
+    });
+    const st = await mountSelfcheck(jsonResponse(200, withErrors));
+    assert.match(textOf(selfBlockOf(st.tree)), /最近出错 2 条/, '摘要（收起态）就要说清有几条');
+    buttonIn(selfBlockOf(st.tree), '展开自检').props.onClick();
+    await tick();
+    const text = textOf(selfBlockOf(st.tree));
+    assert.match(text, /连不上那台电脑/, '最新那一条要摆出来');
+    assert.match(text, /公网访问没起来/, '第二条也在（五条以内全列）');
+    assert.match(text, /不落盘、重启就清空/, '要告诉用户这不是日志，别拿它当历史记录找');
+    st.harness.unmount();
+  });
+
+  await check('最近出错：超过五条只列前五条 + 还有几条（不把面板撑开）', async () => {
+    const many = Object.assign({}, SELF_OK, {
+      errors: Array.from({ length: 8 }, (_, i) => ({
+        at: AT(17, 17, 30 - i), kind: 'service', message: '第 ' + (i + 1) + ' 条错误',
+      })),
+    });
+    const st = await mountSelfcheck(jsonResponse(200, many));
+    assert.match(textOf(selfBlockOf(st.tree)), /最近出错 8 条/);
+    buttonIn(selfBlockOf(st.tree), '展开自检').props.onClick();
+    await tick();
+    const text = textOf(selfBlockOf(st.tree));
+    assert.match(text, /还有 3 条/);
+    assert.doesNotMatch(text, /第 6 条错误/, '第六条起不摆出来，否则展开后一屏全是错误');
+    st.harness.unmount();
+  });
+
+  await check('这条接口没有（宿主是旧版）：说清"装的是新版、跑的可能是旧版"+ 重启', async () => {
+    const st = await mountSelfcheck(jsonResponse(404, { ok: false, error: 'not found' }));
+    const block = selfBlockOf(st.tree);
+    const text = textOf(block);
+    assert.match(text, /没有「自检」这个接口/);
+    assert.match(text, /重启一次 DSH 才会加载新版本/, '下一步只有一句话：重启');
+    assert.equal(byType(block, 'button').filter((b) => textOf(b) === '重新自检').length, 1,
+      '读不到也要给一个"重新自检"');
+    st.harness.unmount();
+  });
+
+  await check('服务还没起来 / 版本读不到：一律说「未知」，不许 NaN、不许崩', async () => {
+    const st = await mountSelfcheck(jsonResponse(200, {
+      ok: true,
+      version: null,
+      process: { startedAtMs: 0, uptimeSec: 0 },
+      code: { file: null, modifiedAtMs: null, stale: null, message: null },
+      routes: [],
+      allowRemoteComputers: false,
+      phoneService: {
+        listening: false, port: null, addresses: [],
+        error: '端口 3090 往后连续 10 个都被占用了。',
+        hostHalf: { pair: false, remoteWindow: false },
+      },
+      dataDir: 'C:\\Users\\me\\.dsh\\dsh-everywhere',
+      rosters: { devices: null, remotes: null },
+    }));
+    buttonIn(selfBlockOf(st.tree), '展开自检').props.onClick();
+    await tick();
+    const tree = selfBlockOf(st.tree);
+    const text = textOf(tree);
+    assert.match(text, /插件版本 未知/);
+    assert.match(text, /宿主进程启动于 未知/);
+    assert.match(text, /接口清单/);
+    assert.match(text, /（读不到）/);
+    assert.match(text, /手机服务：没起来（端口 3090 往后连续 10 个都被占用了。）/, '起不来时把原因说清，别只说"没起来"');
+    assert.match(text, /配对 不在、取票 不在/);
+    assert.match(text, /设备 未知 · 我能连的电脑 未知/);
+    assert.doesNotMatch(text, /NaN|undefined|Invalid Date/);
+    st.harness.unmount();
+  });
+
+  await check('点「重新自检」：再读一次那条接口（服务刚起来、路由刚变时用得着）', async () => {
+    const st = await mountSelfcheck(jsonResponse(200, SELF_OK));
+    const before = st.gets.filter((u) => u === '/mini-remote/selfcheck').length;
+    buttonIn(selfBlockOf(st.tree), '重新自检').props.onClick();
+    await tick();
+    await tick();
+    assert.equal(st.gets.filter((u) => u === '/mini-remote/selfcheck').length, before + 1);
+    st.harness.unmount();
+  });
+
+  await check('自检那一块排在最后（不抢前面那些要操作的位置）', async () => {
+    const st = await mountSelfcheck(jsonResponse(200, SELF_OK));
+    const keys = walk(st.tree)
+      .filter((n) => n && n.props && typeof n.props.key === 'string' && n.props.key !== 'guide')
+      .map((n) => n.props.key);
+    assert.ok(keys.indexOf('selfcheck') >= 0);
+    assert.ok(keys.indexOf('selfcheck') > keys.indexOf('remotes'), '自检排在「其他电脑」后面');
+    st.harness.unmount();
+  });
+}
+
+
+// 4i. B 项目：真实信息里同时有 agent + bAgent 时，项目面板不能把整页渲染打崩
+{
+  console.log('\n[4i] B 项目面板');
+
+  const B_AGENT_OK = {
+    allowed: true,
+    agents: [{ id: 'a1', name: 'B 端电脑', online: true }],
+    projects: [{ id: 'p1', name: '测试项目', bRoot: 'D:\\work\\测试', workspaceId: 'w1', aPath: 'C:\\door' }],
+    presetRegistered: true,
+    presetError: null,
+  };
+  const B_SIDE_OK = {
+    mode: true, connected: true, url: 'http://127.0.0.1:3090',
+    roots: ['D:\\work'], allowWrite: true, allowShell: false, allowManage: true,
+    lastPollAt: Date.now(), lastError: null, error: null,
+  };
+  const PAYLOAD = {
+    ok: true, port: 3090, token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tunnel: null, serve: null, feishu: null, remote: { allowed: false },
+    agent: B_AGENT_OK, bAgent: B_SIDE_OK,
+  };
+
+  const hh = useHarness();
+  let tree = null;
+  hh.onUpdate(() => { tree = hh.draw(Comp, { close: function () {} }); });
+  setGlobal('fetch', async (url) => {
+    if (url === '/mini-remote/agent-list') return jsonResponse(200, { ok: true, agent: B_AGENT_OK });
+    if (url === '/mini-remote/devices') return jsonResponse(200, { ok: true, devices: [] });
+    if (url === '/mini-remote/remotes') return jsonResponse(200, { ok: true, remotes: [] });
+    return jsonResponse(200, PAYLOAD);
+  });
+  tree = hh.draw(Comp, { close: function () {} });
+  hh.runEffects();
+  await tick();
+  hh.runEffects();
+  await tick();
+
+  await check('有 B 项目时设置页不白屏，项目块和 B 文件入口都在', async () => {
+    const collapsed = walk(tree).find((n) => n && n.props && n.props.key === 'group-agent');
+    assert.ok(collapsed, 'B 端协作组要在');
+    assert.equal(walk(collapsed).find((n) => n && n.props && n.props.key === 'bProject'), undefined,
+      'B 端协作默认收起，项目块不摊在页面上');
+    assert.ok(byType(collapsed, 'button').some((b) => textOf(b) === '展开'), '收起时保留展开入口');
+    await expandSettingsGroup(tree, 'agent');
+    assert.doesNotMatch(textOf(tree), /选择 B 文件夹/, '新建创建区默认收起，目录选择入口不直接摊出来');
+    const createEntry = byType(tree, 'button').find((b) => textOf(b) === '新建 B 项目');
+    assert.ok(createEntry, '项目列表上方要有「新建 B 项目」入口');
+    createEntry.props.onClick();
+    await tick();
+    const text = textOf(tree);
+    assert.match(text, /B 项目/);
+    assert.match(text, /B · 测试项目/);
+    assert.match(text, /浏览 B 文件/);
+    assert.match(text, /选择 B 文件夹/, '展开创建区后，目录选择入口要出现');
+    assert.match(text, /D:\\work\\测试/);
+  });
+  hh.unmount();
+}
+
+// 4j. 分组与统一交互：顶部常显、所有大类默认收起、复制与危险按钮一致
+{
+  console.log('\n[4j] 设置页分组与统一交互');
+
+  const ALL = {
+    ok: true,
+    port: 3090,
+    token: TOKEN,
+    entries: [{ kind: 'lan', label: '内网', hint: '手机连同一个 Wi-Fi 时用这个', url: URL_LAN, qr: QR }],
+    tailscale: { installed: true, download: 'https://tailscale.com/download' },
+    tunnel: { enabled: true, mode: 'quick', up: true, starting: false, error: null, publicUrl: null, hasToken: false },
+    serve: { installed: true, on: false, url: null, urlOfOtherPort: null, error: null, needsLogin: false },
+    bRelay: {
+      enabled: true, state: 'running', configured: true, hasActivationCode: true,
+      hostname: 'abcdefghijklmnopqrstuvwxyz.dsh-everywhere.com',
+      url: 'https://abcdefghijklmnopqrstuvwxyz.dsh-everywhere.com',
+      lastError: null, error: null, errorCode: null, reconnectable: true,
+    },
+    selfRelay: {
+      enabled: false, running: false, connected: false, url: '', error: null,
+      frpcPath: '', version: '', configured: false, serverAddr: '',
+      serverPort: 443, publicHost: '', transport: 'wss',
+    },
+    multiRelay: {
+      enabled: true, state: 'running', controlUrl: 'https://admin.relay.example.com',
+      publicHost: 'abcdefghijklmnopqrstuvwxyz.relay.example.com',
+      url: 'https://abcdefghijklmnopqrstuvwxyz.relay.example.com',
+      reconnectable: true, lastError: null, error: null, errorCode: null,
+    },
+    remote: { allowed: false },
+    agent: { allowed: false, agents: [], projects: [], presetRegistered: false, presetError: null },
+    bAgent: {
+      mode: false, connected: false, url: '', roots: [], allowWrite: false,
+      allowShell: false, allowManage: false, lastPollAt: 0, lastError: null, error: null,
+    },
+    feishu: {
+      enabled: false, appId: '', openIds: '', chatIds: '', hasSecret: false,
+      starting: false, running: false, connected: false, rejected: null, error: null,
+    },
+  };
+
+  const SELF = {
+    ok: true,
+    version: '9.9.9',
+    code: { version: '9.9.9', file: null, modifiedAtMs: null, stale: false, message: null },
+    process: { startedAtMs: Date.now() - 120000, uptimeSec: 120, pid: 1234 },
+    routes: [],
+    allowRemoteComputers: false,
+    phoneService: { listening: false, port: null, addresses: [], error: null, hostHalf: { pair: false, remoteWindow: false } },
+    dataDir: 'C:\\Users\\me\\.dsh\\dsh-everywhere',
+    rosters: { devices: 0, remotes: 0 },
+  };
+
+  const hh = useHarness();
+  let tree = null;
+  hh.onUpdate(() => { tree = hh.draw(Comp); });
+  setGlobal('fetch', async (url) => {
+    if (url === '/mini-remote/devices') return jsonResponse(200, { ok: true, devices: [] });
+    if (url === '/mini-remote/remotes') return jsonResponse(200, { ok: true, remotes: [] });
+    if (url === '/mini-remote/selfcheck') return jsonResponse(200, SELF);
+    return jsonResponse(200, ALL);
+  });
+  tree = hh.draw(Comp);
+  hh.runEffects();
+  await tick();
+  hh.runEffects();
+  await tick();
+  hh.runEffects();
+  await tick();
+
+  const groupOf = (key) => walk(tree).find((n) => n && n.props && n.props.key === 'group-' + key);
+  const hasKey = (node, key) => Boolean(walk(node).find((n) => n && n.props && n.props.key === key));
+
+  await check('顶部有「让 AI 带我配置」；没有会话界面时复制提示词', async () => {
+    const button = byType(tree, 'button').find((b) => textOf(b) === '让 AI 带我配置');
+    assert.ok(button, '设置页顶部要有 AI 配置入口');
+    const written = [];
+    setGlobal('navigator', { clipboard: { writeText: async (value) => { written.push(value); } } });
+    button.props.onClick();
+    await tick();
+    assert.equal(written.length, 1);
+    assert.match(written[0], /dsh-everywhere-setup/);
+    assert.match(written[0], /帮我配置手机遥控/);
+  });
+
+  await check('顶部链接与二维码常显，五个大类全部默认收起', () => {
+    const mobile = groupOf('mobile');
+    assert.ok(mobile, '顶部手机连接组要在');
+    assert.match(textOf(mobile), /内网/);
+    assert.match(textOf(mobile), /复制地址/);
+    assert.equal(byType(mobile, 'button').filter((b) => /^(展开|收起)$/.test(textOf(b))).length, 0,
+      '顶部链接区不提供折叠按钮');
+
+    const keys = ['external', 'computers', 'agent', 'feishu', 'diagnostics'];
+    const children = {
+      external: ['tunnel', 'serve', 'b-relay', 'self-relay', 'multi-relay', 'tailscale'],
+      computers: ['remote', 'devices', 'remotes'],
+      agent: ['agent', 'bAgent'],
+      feishu: ['feishu'],
+      diagnostics: ['selfcheck'],
+    };
+    for (const key of keys) {
+      const group = groupOf(key);
+      assert.ok(group, `大类 group-${key} 要在`);
+      assert.ok(byType(group, 'button').some((b) => textOf(b) === '展开'), `group-${key} 收起时要有展开入口`);
+      for (const child of children[key]) {
+        assert.equal(hasKey(group, child), false, `group-${key} 默认收起，不该渲染 ${child}`);
+      }
+    }
+    assert.match(textOf(tree), /连接与固定地址/);
+    assert.match(textOf(tree), /电脑与设备/);
+    assert.match(textOf(tree), /A\/B 端协作/);
+    assert.match(textOf(tree), /通知与集成/);
+    assert.match(textOf(tree), /诊断与高级/);
+    const order = walk(tree)
+      .map((n) => n && n.props && n.props.key)
+      .filter((key) => typeof key === 'string' && key.startsWith('group-'));
+    assert.deepEqual(order, ['group-mobile', 'group-external', 'group-computers', 'group-agent', 'group-feishu', 'group-diagnostics'],
+      '顶部链接区保持第一，大类顺序固定');
+  });
+
+  await check('连接与固定地址内部的小分类默认收起，展开后才出现', async () => {
+    const group = groupOf('external');
+    const top = byType(group, 'button').find((b) => textOf(b) === '展开');
+    assert.ok(top, '大类本身要能展开');
+    top.props.onClick();
+    await tick();
+    const expandedGroup = groupOf('external');
+    assert.ok(byType(expandedGroup, 'button').some((b) => textOf(b) === '展开：公网访问'), '内部小分类要有展开入口');
+    assert.equal(hasKey(expandedGroup, 'tunnel'), false, '内部小分类默认收起，不应渲染公网访问内容');
+    const sub = byType(expandedGroup, 'button').find((b) => textOf(b) === '展开：公网访问');
+    sub.props.onClick();
+    await tick();
+    assert.ok(hasKey(groupOf('external'), 'tunnel'), '展开小分类后才出现公网访问内容');
+    const closeSub = byType(groupOf('external'), 'button').find((b) => textOf(b) === '收起：公网访问');
+    assert.ok(closeSub, '小分类展开后要能收起');
+    closeSub.props.onClick();
+    await tick();
+    assert.equal(hasKey(groupOf('external'), 'tunnel'), false, '小分类收起后内容消失');
+    await collapseSettingsGroup(tree, 'external');
+  });
+
+  await check('每个大类都能展开和收起，内容只在展开后出现', async () => {
+    const cases = [
+      ['external', 'tunnel'],
+      ['computers', 'remotes'],
+      ['agent', 'bAgent'],
+      ['feishu', 'feishu'],
+      ['diagnostics', 'selfcheck'],
+    ];
+    for (const [key, child] of cases) {
+      await expandSettingsGroup(tree, key);
+      if (key === 'external') await expandExternalSubs(() => tree);
+      assert.ok(hasKey(tree, child), `group-${key} 展开后要能看到 ${child}`);
+      assert.ok(byType(groupOf(key), 'button').some((b) => textOf(b) === '收起'), '展开后按钮要变收起');
+      await collapseSettingsGroup(tree, key);
+      assert.equal(hasKey(tree, child), false, `group-${key} 收起后 ${child} 要消失`);
+    }
+  });
+
+  await check('所有复制按钮样式一致，点击后只改自己且 1.5 秒恢复', async () => {
+    await expandSettingsGroup(tree, 'external');
+    await expandExternalSubs(() => tree);
+    const copies = byType(tree, 'button').filter((b) => b.props.style && b.props.style.minWidth === 72);
+    assert.ok(copies.length >= 4, '顶部地址/密码、B 固定地址、多用户中继都该有复制按钮');
+    const firstStyle = copies[0].props.style;
+    for (const one of copies) assert.deepEqual(one.props.style, firstStyle, '复制按钮样式要完全一致');
+    const firstLabel = textOf(copies[0]);
+
+    const written = [];
+    setGlobal('navigator', { clipboard: { writeText: async (value) => { written.push(value); } } });
+    copies[0].props.onClick();
+    await tick();
+    hh.runEffects();
+    await tick();
+    assert.equal(written.length, 1);
+    const done = byType(tree, 'button').filter((b) => textOf(b) === '已复制');
+    assert.equal(done.length, 1, '只改被点的那一个');
+    assert.equal(byType(tree, 'button').filter((b) => b.props.style && b.props.style.minWidth === 72).length, copies.length,
+      '别的复制按钮还在');
+
+    await new Promise((resolve) => setTimeout(resolve, 1600));
+    await tick();
+    assert.equal(byType(tree, 'button').filter((b) => textOf(b) === '已复制').length, 0, '1.5 秒后要恢复');
+    assert.ok(byType(tree, 'button').some((b) => textOf(b) === firstLabel), '恢复成原来的标签');
+  });
+
+  await check('停止等危险动作统一使用危险按钮样式', () => {
+    const bStop = byType(tree, 'button').find((b) => textOf(b) === '停止专属固定地址');
+    const multiStop = byType(tree, 'button').find((b) => textOf(b) === '停止');
+    assert.ok(bStop, 'B 固定地址要有停止按钮');
+    assert.ok(multiStop, '自建多用户中继要有停止按钮');
+    assert.deepEqual(bStop.props.style, multiStop.props.style, '所有停止按钮必须是同一套危险样式');
+    assert.match(String(bStop.props.style.color), /state-error/);
+    assert.match(String(bStop.props.style.border), /state-error/);
+  });
+
+  hh.unmount();
+}
+
+// ---------------------------------------------------------------- 结果
+
+console.log(`\n通过 ${passed} 项，失败 ${failures.length} 项。`);
+if (failures.length) {
+  for (const { label, err } of failures) console.log(`  ✗ ${label}: ${err && err.stack ? err.stack : err}`);
+  process.exitCode = 1;
+}

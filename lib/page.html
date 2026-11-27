@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0a0f16">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>极简遥控器</title>
+<style>
+__PAGE_CSS__
+</style>
+<script>
+  // 主题必须在**首屏画出来之前**定下来，否则浅色手机打开会先闪一下深色底。
+  // 所以这一段留在 <head> 里、样式表后面，**别挪到页面底部那段脚本区去**。
+  (function () {
+    try {
+      var pick = localStorage.getItem('dshMiniTheme') || 'light';
+      var dark = !window.matchMedia || window.matchMedia('(prefers-color-scheme: dark)').matches;
+      var use = pick === 'auto' ? (dark ? 'dark' : 'light') : pick;
+      document.documentElement.setAttribute('data-theme', use);
+      // 首屏时也更新状态栏颜色，否则浅色页配深色状态栏会闪一下
+      var meta = document.querySelector('meta[name="theme-color"]');
+      if (meta) meta.setAttribute('content', use === 'light' ? '#eaf3fc' : '#0a0f16');
+    } catch (e) { /* 无痕模式下 localStorage 会抛；按默认浅色走，不影响页面 */ }
+  })();
+</script>
+</head>
+<body>
+
+<!-- 电脑提问时弹出来的答题卡片。默认隐藏，收到 question 事件才显示。 -->
+<div id="askCard">
+  <div class="qhead" id="askHead"></div>
+  <div class="qtext" id="askText"></div>
+  <div class="qdetail" id="askDetail"></div>
+  <div id="askOpts"></div>
+  <div id="askCustomWrap" style="display:none;margin-bottom:10px">
+    <textarea id="askCustom" rows="3" placeholder="用你自己的话回答……"></textarea>
+  </div>
+  <div class="qfoot">
+    <button id="askBack" type="button">上一题</button>
+    <button id="askOwn" type="button">我自己说</button>
+    <button id="askNext" type="button">下一题</button>
+  </div>
+</div>
+<!-- 电脑要做需要拍板的事时弹出来的审批卡。默认隐藏，收到 approval 事件才显示。
+     命令原文来自会话事件 tool/call 的 arguments（模型原样产出的 JSON），
+     插件按调用编号记着，审批来的时候一起推过来。 -->
+<div id="approveCard">
+  <div class="ahead">电脑被拦下来了，等你拍板</div>
+  <div class="atool" id="approveTool"></div>
+  <div class="areason" id="approveReason"></div>
+  <div class="acmd" id="approveCmd"></div>
+  <div class="afoot">
+    <button id="approveDeny" type="button">拒绝</button>
+    <button id="approveAllow" type="button">同意</button>
+  </div>
+</div>
+
+<header>
+  <button class="icon-btn" id="btnNav" aria-label="工作区与会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M3 12h18M3 18h18"/></svg></button>
+  <span class="dot" id="dot"></span>
+  <span class="brand">极简遥控器</span>
+  <span class="status" id="status">连接中…</span>
+  <button class="icon-btn" id="btnSubagents" aria-label="子智能体"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 12H11M11 6v12M11 6h4.8M11 18h4.8"/><circle cx="6" cy="12" r="2.2"/><circle cx="18" cy="6" r="2.2"/><circle cx="18" cy="18" r="2.2"/></svg></button>
+  <button class="icon-btn" id="btnSettings" aria-label="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h8M16 7h4M4 17h4M12 17h8"/><circle cx="14" cy="7" r="2.2"/><circle cx="10" cy="17" r="2.2"/></svg></button>
+</header>
+
+<!-- 模型与思考强度（2026-09-25 用户要求：手机上要能改每个会话的模型和强度）。
+
+     现在两件事都在了：顶部那一行显示当前用的模型，**点它弹出面板可以改**。
+     面板里的强度只画当前模型自己声明的档位；模型不支持调强度时那一行不出现。
+
+     **整段是自包含的**：自己的 script 标签、自己的请求、自己的元素，不碰页面现有的
+     任何代码。唯一的对外依赖是 /mini/api/models 那条接口（已经验过真数据）。
+     这样即使这段整个坏掉，也不会影响已经能用的部分。
+
+     没拿到数据之前整条藏着——**宁可什么都不显示，也不显示一个占位的假值**。 -->
+<div id="modelBar" style="display:none;align-items:center;gap:8px;padding:6px 12px;font-size:12px;color:var(--dim,#888);border-bottom:1px solid var(--line,#e5e5e5)">
+  <span id="modelBarText"></span>
+</div>
+
+<main id="main">
+  <div id="reply"></div>
+  <!-- 「正在执行」是常驻元素，不参与 #reply 的整块重绘。
+       拼进重绘里的话，每次状态广播都会把它重建一次，轮播和浮动动画会一直从头开始。 -->
+  <div id="work" class="work" hidden>
+    <div class="work-top">
+      <div class="work-stage" id="workStage"></div>
+      <div class="work-bubble" id="workBubble">正在执行…</div>
+    </div>
+    <div class="work-progress"><i></i></div>
+    <div class="work-foot">
+      <span class="work-elapsed" id="workElapsed"></span>
+      <button class="stop" id="btnStop" type="button">停止</button>
+    </div>
+  </div>
+
+  <!-- 排队中的指令。**它必须留在 #work 外面。**
+       原来它挂在 #work 里面，而 #work 在回答开始流式生成时会整块隐藏
+       （用户 2026-09-22 提的「内容开始流式生成的时候，鲸鱼娘的动画就可以消失了」），
+       于是排队列表被一起藏掉了。用户 2026-09-22 报：「排队列表现在手机端直接没出现了」。
+       这个 bug 是**被流式修好之后才变明显的**：门槛从 120 降到 40 之后，回答很早就开始
+       流式、state.live 长期有值，用户接着发指令时正好落在那个窗口里。
+       排队和鲸鱼娘是两件事——前者是「还有几条在等」，后者是「她正在忙」，
+       别因为后者要藏就把前者一起藏了。 -->
+  <div class="queue" id="queue" hidden></div>
+
+  <!-- 「回到底部」浮标（2026-10-08 用户要求）。样子参考电脑端 DSH 那颗
+       （ChatView.module.css 的 .xz4KEq_toBottom：34×34 圆底 + 一根 14×14 的下折线 svg），
+       位置、尺寸和配色按手机这页的规格重做，见样式表里那一段。
+
+       **它必须留在 #reply 外面**：跟 #work 同一个道理——拼进重绘里的话，每次状态广播
+       都会把它重建一次，用户正按着它就没了。也**必须在 main 里面**：只有作为滚动口的孩子，
+       CSS 的 sticky 才贴得住（位置由 CSS 算，脚本一个像素都不碰）。
+
+       箭头路径原样抄自电脑端那颗图标（dsh-client-ui-primitives 的 IconChevronDownOutline），
+       没有自己重画：viewBox 0 0 16 16、1px 描边、fill:none、颜色走 currentColor。 -->
+  <div class="to-bottom-slot" id="toBottomSlot">
+    <button class="to-bottom" id="toBottom" type="button" aria-label="回到底部" hidden>
+      <svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1"><path d="M4 6L7.29289 9.29289C7.68342 9.68342 8.31658 9.68342 8.70711 9.29289L12 6"/></svg>
+    </button>
+  </div>
+</main>
+
+<div class="attach-bar" id="attachBar" hidden></div>
+
+<!-- 在输入框里打 / 时弹出来的指令列表。和附件小条一样排在底栏**上面**：
+     盖住输入框的话，用户就看不清自己正在打什么了。 -->
+<div class="cmd-menu" id="cmdMenu" hidden></div>
+
+<!-- 待办条（2026-11-14）：常驻在输入框上方，一行摘要；点开看全部。没有待办时整条不出现。 -->
+<div id="todoBar" hidden>
+  <button id="todoSummary" type="button"></button>
+  <div id="todoList" hidden></div>
+</div>
+
+<footer>
+  <!-- 统一入口。位置和尺寸一个像素都没动（还是原来回形针那个 42×42），改的只是点了之后
+       干什么：原来直接开文件选择器，现在开下面那张统一操作面板（文件 + 指令都在里面）。
+       input 藏起来，按钮点它——iOS 上直接放一个 file input 样式很难统一。 -->
+  <button class="attach" id="btnAttach" type="button" aria-label="添加文件或调用指令" title="添加文件或调用指令">
+    <!-- 图标是 DSH 桌面端那个鲸鱼（dsh-client-ui-primitives 的 FishLogo，
+           viewBox 0 0 23.16 17.04）。路径**原样抄自桌面端**，没有自己重画。
+           填色走 currentColor，所以跟着按钮的 var(--muted) 走，深浅两套主题各自适配。 -->
+      <svg viewBox="0 0 23.16 17.04" aria-hidden="true"><path d="M22.9168 1.43018C22.6713 1.31018 22.5658 1.53918 22.4223 1.65519C22.3733 1.69269 22.3318 1.74169 22.2903 1.78669C21.9317 2.1697 21.5127 2.42121 20.9657 2.39121C20.1657 2.34621 19.4827 2.59771 18.8787 3.20973C18.7502 2.45521 18.3236 2.0047 17.6746 1.71569C17.3351 1.56568 16.9916 1.41518 16.7536 1.08867C16.5876 0.856163 16.5421 0.597155 16.4591 0.341647C16.4061 0.187643 16.3536 0.0301382 16.1761 0.00363739C15.9836 -0.0263635 15.9081 0.135141 15.8326 0.270145C15.5306 0.822162 15.4136 1.43018 15.4251 2.0462C15.4516 3.43174 16.0366 4.53527 17.1991 5.3203C17.3311 5.4103 17.3651 5.5003 17.3236 5.63181C17.2441 5.90231 17.1501 6.16482 17.0671 6.43533C17.0141 6.60784 16.9351 6.64584 16.7501 6.57033C16.1121 6.30383 15.5611 5.90931 15.074 5.4328C14.2475 4.63328 13.5 3.75075 12.568 3.05973C12.349 2.89822 12.13 2.74822 11.9034 2.60522C10.9524 1.68169 12.028 0.923165 12.277 0.833162C12.5375 0.739159 12.3675 0.41615 11.5259 0.42015C10.6844 0.42365 9.91439 0.705658 8.93286 1.08117C8.78935 1.13767 8.63835 1.17867 8.48384 1.21267C7.59332 1.04367 6.66829 1.00617 5.70226 1.11517C3.88321 1.31768 2.43016 2.1777 1.36213 3.64575C0.0790928 5.4103 -0.222916 7.41536 0.146595 9.50642C0.535106 11.7105 1.66014 13.535 3.38869 14.9616C5.18125 16.4406 7.24581 17.1657 9.60138 17.0266C11.0319 16.9441 12.6245 16.7526 14.421 15.2321C14.874 15.4576 15.3496 15.5476 16.1381 15.6151C16.7456 15.6716 17.3306 15.5851 17.7836 15.4911C18.4931 15.3411 18.4441 14.6841 18.1876 14.5636C16.1081 13.595 16.5646 13.9891 16.1496 13.67C17.2061 12.42 18.8202 10.1979 19.3182 7.17235C19.3672 6.83834 19.4297 6.36783 19.4222 6.09732C19.4182 5.93231 19.4562 5.86831 19.6447 5.84931C20.1657 5.78931 20.6712 5.64681 21.1357 5.3913C22.4833 4.65528 23.0268 3.44624 23.1548 1.9972C23.1738 1.77569 23.1508 1.54668 22.9168 1.43018ZM11.1749 14.4736C9.15936 12.889 8.18184 12.3675 7.77832 12.39C7.40081 12.4125 7.46881 12.8445 7.55182 13.126C7.63882 13.404 7.75182 13.5955 7.91033 13.8396C8.01983 14.0011 8.09533 14.2411 7.80083 14.4216C7.15181 14.8231 6.02327 14.2866 5.97027 14.2601C4.65673 13.4865 3.5587 12.4655 2.78467 11.069C2.03715 9.72493 1.60314 8.28289 1.53164 6.74384C1.51264 6.37233 1.62214 6.24082 1.99215 6.17332C2.47916 6.08332 2.98118 6.06432 3.46769 6.13582C5.52476 6.43633 7.27581 7.35586 8.74385 8.8129C9.58188 9.64243 10.2159 10.634 10.8689 11.6025C11.5634 12.631 12.3105 13.611 13.262 14.4146C13.598 14.6961 13.866 14.9101 14.1225 15.0681C13.349 15.1546 12.058 15.1731 11.1749 14.4746L11.1749 14.4736ZM12.141 8.25988C12.141 8.09488 12.273 7.96338 12.439 7.96338C12.4765 7.96338 12.5105 7.97088 12.541 7.98188C12.5825 7.99688 12.6205 8.01938 12.6505 8.05338C12.7035 8.10588 12.7335 8.18088 12.7335 8.25988C12.7335 8.42489 12.6015 8.55639 12.4355 8.55639C12.2695 8.55639 12.141 8.42489 12.141 8.25988ZM15.1415 9.79893C14.949 9.87793 14.7565 9.94544 14.5715 9.95294C14.2845 9.96794 13.9715 9.85143 13.8015 9.70893C13.5375 9.48742 13.3485 9.36342 13.2695 8.97691C13.2355 8.8119 13.2545 8.55639 13.2845 8.40989C13.3525 8.09438 13.277 7.89187 13.0545 7.70787C12.8735 7.55786 12.643 7.51636 12.39 7.51636C12.2955 7.51636 12.209 7.47486 12.1445 7.44136C12.039 7.38886 11.9519 7.25735 12.035 7.09585C12.0615 7.04335 12.19 6.91584 12.22 6.89334C12.5635 6.69784 12.9595 6.76184 13.326 6.90834C13.6655 7.04735 13.9225 7.30236 14.292 7.66287C14.6695 8.09838 14.7375 8.21838 14.9525 8.54539C15.1225 8.8009 15.277 9.06341 15.3831 9.36392C15.4471 9.55142 15.3641 9.70493 15.1415 9.79893Z" fill="currentColor"/></svg>
+  </button>
+  <input type="file" id="filePick" hidden>
+  <textarea id="input" rows="1" placeholder="说点什么…" enterkeyhint="send"></textarea>
+  <button class="send" id="btnSend">发送</button>
+</footer>
+
+<div id="nav">
+  <aside class="nav-panel">
+    <div class="nav-head">
+      <span>工作区与会话</span>
+      <button class="icon-btn" id="btnNavRefresh" aria-label="刷新"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 5v6h-6"/></svg></button>
+      <button class="icon-btn" id="btnNavClose" aria-label="关闭"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+    </div>
+    <div class="nav-body" id="navBody"></div>
+  </aside>
+</div>
+
+<!-- 归档确认。**独立于抽屉之外**：抽屉能被关掉，而这一问必须挡住整屏——
+     它要停下来的是正在电脑上跑的工作，不该因为用户顺手关了抽屉就悄悄消失。
+     里面的内容（会停掉哪几族工作）由 renderNavConfirm 现填。 -->
+<div id="navConfirm" role="dialog" aria-modal="true" aria-labelledby="navConfirmTitle">
+  <div class="nc-panel">
+    <h3 id="navConfirmTitle">停止并归档此会话？</h3>
+    <p id="navConfirmDesc"></p>
+    <ul id="navConfirmList"></ul>
+    <div class="nc-foot">
+      <button type="button" data-nc-cancel="1">取消</button>
+      <button type="button" class="danger" data-nc-ok="1">停止并归档</button>
+    </div>
+  </div>
+</div>
+
+<div id="settings">
+  <div class="sheet">
+    <!-- 页眉。整屏之后「点外面关掉」没了，所以这里必须有一个一直看得见的关闭口
+         （滚到哪儿都在）；底部那个「完成」照样留着。
+
+         它在**滚动区外面**（里面那个 .sheet-body 才是滚动区）：这样页眉底下就是抽屉
+         本来那层毛玻璃，不用为它另铺一层底色——铺了会叠出更深的色，顶部一道色差。 -->
+    <div class="sheet-head">
+      <h2>设置</h2>
+      <button class="btn" id="btnSettingsClose">关闭</button>
+    </div>
+    <div class="sheet-body">
+
+    <div class="row">
+      <div>
+        <div class="label">显示模式</div>
+        <div class="hint" id="hintMode">单帧：只留最新一条回复</div>
+      </div>
+      <div class="seg" id="segMode">
+        <button data-mode="minimal">单帧</button>
+        <button data-mode="chat">聊天</button>
+        <button data-mode="full">完整</button>
+      </div>
+    </div>
+
+    <!-- 外观。深色是原来的样子；浅色的色调跟宣传图（docs/promo.png）统一：
+         近白冰蓝的底、深宝蓝的字与状态色、白色卡片。选择记在这台设备上。 -->
+    <div class="row">
+      <div>
+        <div class="label">外观</div>
+      </div>
+      <div class="seg" id="segTheme">
+        <button data-theme="dark">深色</button>
+        <button data-theme="light">浅色</button>
+        <button data-theme="auto">跟随系统</button>
+      </div>
+    </div>
+
+    <!-- 字体大小：三档，存 localStorage，改 CSS 变量 --font-base -->
+    <div class="row">
+      <div>
+        <div class="label">字体大小</div>
+      </div>
+      <div class="seg" id="segFont">
+        <button data-font="small">小</button>
+        <button data-font="normal">标准</button>
+        <button data-font="large">大</button>
+      </div>
+    </div>
+
+    <!-- 权限档位。整块由脚本填：这台电脑有哪些档位是**运行时读**的，一个都不写死。
+         服务拿不到时整块不显示——它是附加能力，缺了遥控本身照常。 -->
+    <div id="permBlock" hidden>
+      <div class="row">
+        <div>
+          <div class="label">权限档位</div>
+          <div class="hint" id="permHint">作用在当前会话上</div>
+        </div>
+      </div>
+      <div class="seg" id="segPerm"></div>
+    </div>
+
+    <!-- 繁忙时的发送行为（2026-10-05 用户要求搬进手机设置）。
+         PC 上「设置 → 通用 → 繁忙时的发送行为」就是它：智能体跑着的时候，
+         你发的那句话是排队等这一轮跑完，还是当场插进去让它调整方向。
+         **两端共用宿主那一份设置**——手机上改，电脑上也是这个值。
+         文案照抄 PC 词条表（settings.enter.*），一个字不自创。
+         读不到时整条藏起来（见 loadBusyEnter），不摆一个点了没用的开关。 -->
+    <div class="row" id="rowBusyEnter" hidden>
+      <div>
+        <div class="label">繁忙时的发送行为</div>
+        <div class="hint">智能体运行时发送按钮的行为</div>
+      </div>
+      <div class="seg" id="segBusyEnter">
+        <button data-busy="queue">排队发送</button>
+        <button data-busy="steer">插话发送</button>
+      </div>
+    </div>
+
+    <!--
+      这里原来有两行：「完成后提醒」和「语音输入」。
+
+      2026-09-21 用户裁决：**两行都从设置里撤掉，不让用户看到**——
+      它们都是浏览器安全上下文的限制（明文 http 下 Notification 和麦克风都用不了），
+      写在设置里只是把浏览器的一条规矩转嫁给用户去理解。相关知识记在下面
+      「浏览器系统通知」那段注释和 tasks/lessons.md 里，不占用户界面。
+
+      想用语音输入：手机键盘自带的 🎤 听写键，任何连接下都能用。
+      想人不在也能收到提醒：电脑端的外部推送（Bark / ntfy / Telegram），
+      从服务器发出去，不受浏览器这条规矩限制。
+    -->
+
+    <!--
+      **流式输出**（2026-10-21 用户要求做成全局切换）。
+
+      开着：回答正文一个字一个字往外冒，跟你在这台电脑上看到的节奏一样。
+      关着：等整段落定再显示（原来的样子）。
+
+      **单帧模式不跟**（用户拍板）：那一屏就是"只看最终那一句"，字一个个往外冒反而毁掉它。
+      所以开到「单帧」时这里的开关是灰的（见 syncSeg 里那句 disabled）。
+
+      开关状态存本机，但它决定的是连上去要不要带 `stream=1`——**关掉时服务端连正文帧都不发**，
+      是真省流量，不是收到了再丢掉。
+    -->
+    <div class="row">
+      <div>
+        <div class="label">流式输出</div>
+        <div class="hint">回答一个字一个字地出来；关掉就等整段写完再显示</div>
+      </div>
+      <div class="seg" id="segStreaming">
+        <button data-streaming="on">开</button>
+        <button data-streaming="off">关</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <div class="label">提示音与震动</div>
+        <div class="hint">回复到达时提醒（需先点一次页面）</div>
+      </div>
+      <div class="seg" id="segSound">
+        <button data-sound="on">开</button>
+        <button data-sound="off">关</button>
+      </div>
+    </div>
+
+    <!--
+      「页面在后台时提醒」。**现在不露出来了，藏到底。**
+
+      2026-09-21 它整行被撤掉过，理由是当时三条连接路径全是明文 http，浏览器不给发
+      系统通知，摆出来只是让用户点一下碰一鼻子灰。
+
+      2026-09-25 白天 Tailscale 那条路接通 HTTPS，它回来过一次；**当晚又撤了**。
+      第二次撤的理由和第一次不同，也更硬：**手机锁屏会冻结后台页面**，那条实时连接
+      跟着断掉，回复根本到不了页面，也就没人去发通知。这不是"前提没到"，是浏览器这条
+      路本来就有上限——service worker 也救不了，它是被事件唤醒的，没有事件它就不存在。
+
+      用户原话：「类似功能我们以后考虑做成 APP 时再加，浏览器里不放了。」
+
+      **代码全部留着，只是不露出来**（见下面 serviceWorker.register 那段的注释）。
+      将来做 App 里的锁屏提醒，这些知识直接能用。真正不怕锁屏的是电脑端那条外部推送
+      （Bark/ntfy/Telegram，lib/notify.js），从服务器直接发出去，不经过浏览器。
+
+      为什么非要有 service worker：手机浏览器上 new Notification() 会直接抛 TypeError，
+      唯一能发系统通知的入口是 ServiceWorkerRegistration.showNotification()。
+      详见 lib/sw.js。
+    -->
+    <div class="row" id="rowNotify" style="display:none">
+      <div>
+        <div class="label">页面在后台时提醒</div>
+        <div class="hint" id="notifyHint">回复到了发一条系统通知</div>
+      </div>
+      <div class="seg" id="segNotify">
+        <button data-notify="on">开</button>
+        <button data-notify="off">关</button>
+      </div>
+    </div>
+
+    <div class="row">
+      <div>
+        <div class="label">连接</div>
+        <div class="hint" id="connHint">—</div>
+      </div>
+      <button class="btn" id="btnReconnect">重连</button>
+    </div>
+
+    <div class="row">
+      <div>
+        <div class="label">插件</div>
+        <div class="hint">查看官方插件和已安装插件</div>
+      </div>
+      <button class="btn" id="btnPlugins">查看</button>
+    </div>
+
+    <!--
+      「进阶设置（电脑端界面）」（2026-10-06 用户要求）。
+
+      手机上这张遥控页是**专门为手机做的**，所以电脑上那些插件贡献的设置页它进不去。
+      这一项是退路：**把电脑端的界面整个搬过来看**——同一份界面，不迁移、不逐个适配。
+
+      **默认关，而且开着要付代价**：打开它 = 把这个令牌的权限从「我们那张手机页暴露的
+      那点事」扩到**整个电脑端设置面**（模型配置、凭据页、插件装卸、会话记录……）。
+      所以：默认关、后果写在提示里、开启要点两次（见下面 tapMirror）。
+
+      服务端没这个能力时（没拿到 DSH_WEB_URL）整行不显示——**不摆一个假的开关**，
+      和「繁忙时的发送行为」同一条口径。 -->
+    <div class="row" id="rowMirror" hidden>
+      <div>
+        <div class="label">进阶设置</div>
+        <div class="hint" id="mirrorHint">打开电脑上的 DSH 界面，改那些手机上没有的设置</div>
+      </div>
+      <div class="seg" id="segMirror">
+        <button data-mirror="on">开</button>
+        <button data-mirror="off">关</button>
+      </div>
+    </div>
+
+    <div class="row" id="rowMirrorOpen" hidden>
+      <div>
+        <div class="label">电脑端界面</div>
+        <div class="hint">电脑端dsh完整页面</div>
+      </div>
+      <button class="btn" id="btnMirrorOpen" type="button">打开</button>
+    </div>
+
+    <div class="foot">
+      <button class="btn" id="btnForget">重新输入令牌</button>
+      <button class="btn primary" id="btnClose">完成</button>
+    </div>
+
+    <div class="version" id="dshVersion" hidden></div>
+    </div>
+  </div>
+</div>
+
+<!--
+  「电脑端设置界面」那一整屏：**嵌在这一页里，不跳转、不开新标签。**
+
+  ## 为什么最后做成内嵌（2026-10-06 用户三次实机报「点击打开没反应」）
+
+  前两版都想让它「打开」出去，都栽了：
+  · 第一版 `<a target="_blank">`：内嵌浏览器（微信这类）常把新标签直接拦掉；
+  · 第二版加了 JS 兜底（`window.open` 失败就同标签跳）：还是没反应——那些浏览器里
+    `window.open` 会「成功」返回一个对象，代码以为开好了就不再跳，而新标签开在后台；
+  · 第三版干脆用普通 `<a href>` 同标签跳（理论上拦不掉）：**用户那边仍然没反应**。
+
+  三次都在赌「跳转」这个动作本身。**这一版不赌了**：点一下只是把这一层显示出来、
+  给里面的框设个地址——没有跳转、没有新标签、没有弹窗，**浏览器没有任何东西可以拦**。
+  已经用真浏览器验过：那个界面**愿意被嵌**（不设「不许被嵌」的响应头，实测里面
+  标题、侧栏、欢迎页全都正常）。
+
+  另外整行都能点（不只右边那个按钮）——按钮只有 54×40，手指容易点偏。
+-->
+<div id="mirrorView" hidden>
+  <!-- 顶部感应带：桌面上「鼠标贴到屏幕顶部」那一下由它接住。手机上它是 display:none，
+       那时横条本来就常驻——为什么必须有它、为什么手机不吃这一套，见样式表那段说明。 -->
+  <div id="mirrorHot"></div>
+  <!-- 横条外面这层壳是「收 / 放」用的：收起时压成 0 高，官方界面自己长上来填满。 -->
+  <div class="mv-hot" id="mirrorBar">
+    <div class="mv-bar">
+      <span class="mv-title" id="mirrorTitle" title="长按：打开诊断模式">电脑端界面</span>
+      <button class="btn" id="mirrorClose" type="button">返回</button>
+    </div>
+  </div>
+  <!-- 地址是点开那一刻才设的：没点之前一个字节都不加载。 -->
+  <iframe id="mirrorFrame" title="电脑端界面"></iframe>
+</div>
+
+<!-- 正文里点开的文件：只读抽屉（2026-11-03）。手机上没有电脑端的文件预览，这一屏补上。 -->
+<div id="fileView"><div class="sheet">
+  <div class="file-head"><h2 id="fileTitle">文件</h2>
+    <button class="btn" id="fileCopy" type="button">复制</button>
+    <button class="btn" id="fileClose" type="button">关闭</button></div>
+  <div class="file-body" id="fileBody"></div>
+</div></div>
+
+<!-- 统一操作面板：输入框旁边那一个入口点开的就是它，上面「添加文件」、下面「调用指令」。
+     原来这两件事各有各的门（回形针直接开文件选择器、打 `/` 才弹指令菜单），手机上没人
+     知道打一个斜杠还能调指令。
+
+     外壳是设置抽屉那一套**一模一样**的写法（`#xxx.open` 即时显隐 + `.sheet` 贴底），
+     不新建样式体系；令牌、圆角、细边框也全是现成的。
+
+     它盖住整屏、贴着底边（和设置抽屉同一层），所以不和底栏抢位置；打开时先把键盘收起来，
+     不然手机键盘会把这张抽屉顶到看不见的地方。 -->
+<div id="ops">
+  <div class="sheet">
+    <div class="ops-head">
+      <h2>添加文件</h2>
+      <button class="btn" id="opsClose">关闭</button>
+    </div>
+    <div class="ops-acts">
+      <button class="btn" id="opsPick" type="button">选文件</button>
+      <button class="btn" id="opsShot" type="button">拍照</button>
+    </div>
+    <!-- 已选文件的去处和附件小条**是同一份数据**（state.uploads，同一个 renderAttach）。
+         这里画一遍是为了让用户在面板里就看得到自己带了什么，不必先关掉面板。 -->
+    <div class="ops-files" id="opsFiles" hidden></div>
+
+    <h2 class="ops-sub">调用指令</h2>
+    <input class="ops-filter" id="opsFilter" type="text" placeholder="筛选指令…"
+           autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+    <div class="ops-cmds" id="opsCmds"></div>
+  </div>
+</div>
+
+<!-- 子智能体：清单沿用设置抽屉。点一条后 #subagents 加 .doc-open，
+     同一块区域变成全屏会话；顶栏显示名字和状态，正文按时间混排对话与轨迹。
+     清单取手机当前绑定的会话，续话与停止沿用原有底部操作。 -->
+<div id="subagents">
+  <div class="sheet">
+    <div class="sa-head">
+      <button class="sa-back" id="subagentsBack" hidden>‹ 返回</button>
+      <h2 id="subagentsTitle">子智能体</h2>
+      <span class="sa-sub" id="subagentsStatus" hidden></span>
+      <button class="btn" id="subagentsClose">关闭</button>
+    </div>
+    <div class="sa-list" id="subagentsList"></div>
+    <div class="sa-doc" id="subagentsDoc" hidden></div>
+  </div>
+</div>
+
+<!-- 轨迹面板（2026-11-03）：过程组窗口右下角那个「最大化」点开的就是它。
+     整场会话的工具调用/助手动作按轮次列出来，点一条跳回聊天里那一处。 -->
+<!-- 工作区文件树（2026-11-14 用户拍板放开）：只读，点了用文件抽屉预览。 -->
+<div id="fileTree" hidden>
+  <div class="tree-head">
+    <button id="treeBack" type="button" aria-label="上一层">←</button>
+    <span id="treeTitle">工作区文件</span>
+    <button id="treeClose" type="button">关闭</button>
+  </div>
+  <div id="treeBody"></div>
+</div>
+<div id="imgView" hidden><img id="imgViewImg" alt="图片预览"><button id="imgViewSave" type="button">存到手机</button><button id="imgViewClose" type="button">关闭</button></div>
+<div id="trajPanel">
+  <div class="sheet">
+    <div class="file-head">
+      <h2>轨迹</h2>
+      <button class="btn" id="trajClose" type="button">关闭</button>
+    </div>
+    <div class="traj-tools">
+      <button class="btn tj-btn" id="trajDur" type="button">时长</button>
+      <button class="btn tj-btn" id="trajTurns" type="button">轮次</button>
+      <button class="btn tj-btn" id="trajCalls" type="button">调用</button>
+      <input class="ops-filter" id="trajFilter" type="text" placeholder="搜索"
+             autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
+    </div>
+    <div class="traj-strip">
+      <div class="ts-labels"><i>输入</i><i>模型</i><i>工具</i></div>
+      <div class="ts-scroll" id="trajStrip">
+        <div class="ts-inner">
+          <div class="ts-times" id="trajTimes"></div>
+          <div class="traj-strip-in" id="trajStripIn"></div>
+        </div>
+      </div>
+    </div>
+    <div class="traj-list" id="trajList"></div>
+    <div class="traj-details" id="trajDetails" data-snap="most" hidden>
+      <div class="td-grab" id="tdGrab"></div>
+      <div class="td-head">
+        <span class="td-title" id="tdTitle"></span>
+        <button class="btn" id="tdClose" type="button">关闭</button>
+      </div>
+      <div class="td-tabs" id="tdTabs" role="tablist">
+        <button class="td-tab" type="button" role="tab" data-td-tab="overview" aria-selected="true">概览</button>
+        <button class="td-tab" type="button" role="tab" data-td-tab="payload" aria-selected="false">载荷</button>
+      </div>
+      <div class="td-body" id="tdBody"></div>
+    </div>
+  </div>
+</div>
+
+<!-- 插件页面（2026-10-04 用户要求：移动端设置里加插件入口）。
+     外壳和子智能体面板同一套（.sheet），显示官方插件和已安装插件（内置+第三方）。 -->
+<div id="plugins">
+  <div class="sheet">
+    <div class="sa-head">
+      <h2>插件</h2>
+      <button class="btn" id="pluginsClose">关闭</button>
+    </div>
+    <div class="sa-list" id="pluginsList">
+      <div class="sa-none sa-none-indent">正在读取插件列表…</div>
+    </div>
+  </div>
+</div>
+
+<div id="gate">
+  <h1>需要访问令牌</h1>
+  <p class="revoked" id="gateRevoked" hidden>这台设备的授权已被移除，请重新扫码。</p>
+  <p>在电脑上打开 DSH 的「设置 → 遥控设置」，用手机重新扫一次二维码就能进来。
+     或者把那一页上的链接整条复制到浏览器地址栏打开。</p>
+  <input id="gateInput" type="text" placeholder="粘贴 token" autocomplete="off"
+         autocapitalize="off" autocorrect="off" spellcheck="false">
+  <div class="err" id="gateErr"></div>
+  <button id="gateBtn">进入</button>
+</div>
+
+<div id="toast"></div>
+
+<script>
+__PAGE_JS__
+</script>
+</body>
+</html>

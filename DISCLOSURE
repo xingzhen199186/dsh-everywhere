@@ -1,0 +1,164 @@
+dsh-everywhere — DISCLOSURE (dual-use content)
+================================================================
+
+This file declares the security-relevant ("dual-use") capabilities of this
+package, as required by the npm Dual-Use Content Policy
+(https://docs.npmjs.com/policies/dual-use). It describes what the software can
+do and what it is legitimately for.
+
+
+WHAT THIS PACKAGE IS
+----------------------------------------------------------------
+dsh-everywhere is a host plugin for DeepSeek Harness (DSH), a desktop AI
+harness. A user installs it on a computer they own and operate, and then uses
+their own phone to reach that same computer.
+
+It is not a service. There is no backend operated by the maintainer, no
+telemetry, no analytics, and no code that executes on any machine other than
+the one that installed the plugin and the device the owner paired to it.
+
+
+CLASSIFICATION
+----------------------------------------------------------------
+This package is a tool "designed and documented explicitly", in the sense of the
+Acceptable Content section of the npm Open Source Terms:
+
+  "Content containing malicious computer code ... Tools designed and documented
+   explicitly to assist in security research are acceptable, but exploits and
+   malware that use the npm registry as a deployment or delivery vector are not."
+
+To be explicit about which side of that line this package sits on:
+
+- It is not malicious code. It does not self-propagate, does not hide its
+  behaviour, does not hook or modify other processes, and does not persist
+  beyond the plugin's own installation directory.
+- It is not a deployment or delivery vector. The package ships no executable
+  files. The two external tunnel programs described below are downloaded only
+  after the owner enables the corresponding feature; frpc is checked against a
+  pinned SHA-256 hash before use. The Android application referenced by the
+  project is installed by the owner from a release the project publishes, not
+  delivered through the registry.
+- Every capability that could be mistaken for malicious behaviour is listed
+  below by name, with its switch, its default, and how it is authorised.
+- All security-relevant features are off by default. A fresh install listens on
+  the loopback interface only and accepts no remote device until the machine's
+  owner turns remote access on and pairs a device with a one-time code.
+
+
+CAPABILITIES THAT AUTOMATED SCANNING MAY FLAG
+----------------------------------------------------------------
+1. Remote command execution.
+   Once a phone is paired, the owner can send shell commands to the host
+   computer and read their output. Used to run build, test, and git commands
+   from the phone.
+
+2. File read and write on the host.
+   Restricted to folders the owner explicitly lists in the host settings. Paths
+   outside that list are rejected by the host, not by the client.
+
+3. Screen capture and input on a paired Android device.
+   The companion Android application can show the phone screen and inject taps
+   and text. This requires the device owner to grant the Android accessibility
+   service; without that grant the capability is unavailable.
+
+4. Tunnelling.
+   - This package ships **no executable files of any kind**. At runtime it can
+     use three external programs: Cloudflare's cloudflared, FRP's client frpc,
+     and a Tailscale-compatible node.
+   - How those programs arrive is stated plainly, because it matters:
+       * cloudflared: if neither a configured path, nor PATH, nor a copy already
+         downloaded by the dsh-pocket plugin is available, the plugin downloads
+         it once from Cloudflare's official GitHub releases (with mirror
+         fallbacks) into its own data directory. About 50 MB, one time, and only
+         after the owner turns on a tunnel.
+       * frpc: downloaded on demand, with the same pattern as cloudflared, from
+         this project's own GitHub releases. Its SHA-256 is pinned in the source
+         and checked after download; a mismatch is discarded. About 16 MB, one
+         time, only when the owner switches on a relay they host themselves.
+       * Tailscale: whatever the owner installed; the plugin only reads its
+         local socket or CLI.
+   - No program is started without an explicit action by the owner switching
+     that feature on.
+   - The FRP client is Apache-2.0 licensed; its licence text and provenance
+     notes now live in the repository under tools/, beside the binary, rather
+     than inside the published package.
+   - Earlier versions (0.2.x through 0.3.1) bundled frpc.exe for convenience.
+     Since 0.3.1 that binary and the relay deployment script moved out of the
+     published package to the project's repository and releases, so the
+     registry copy contains only JavaScript, stylesheets, images and text.
+   - Deploying the optional relay server is described in the repository
+     (relay-server/), not shipped here.
+
+5. A local HTTP server and a WebSocket stream.
+   Bound to the host, serving the phone page and the live session stream. Access
+   requires either a password, a device credential issued at pairing time, or,
+   from the loopback interface only, no credential at all.
+
+6. Optional integrations.
+   Feishu (Lark) notifications, and execution of scheduled tasks. Both are off
+   unless the owner configures them.
+
+
+THIRD-PARTY CODE INSIDE THE TARBALL
+----------------------------------------------------------------
+About 1.7 MB of the package is unmodified, minified builds of two upstream
+front-end libraries, shipped so the phone page can render documents and maths
+without fetching anything from a CDN at runtime:
+
+  - PDF.js (Mozilla, Apache-2.0): pdf.min.js and pdf.worker.min.js, used to show
+    PDF attachments inline.
+  - KaTeX (MIT): katex.min.js, katex.min.css and its font files, used to render
+    mathematical notation.
+
+They are minified because that is how upstream publishes them; they are not
+obfuscated, and they are upstream artefacts: pdfjs-dist 3.11.174 (legacy build)
+and katex 0.16.11, each with a README in lib/vendor/ naming its source. Nothing here is first-party code, and neither
+library performs network, process or filesystem operations beyond rendering.
+
+The plugin's own code is plain, unminified JavaScript under lib/ and client/.
+
+package.json also declares third-party identifiers (`foo/bar` form); those are
+standard Cordis service names, not URLs or commands.
+
+HOW ACCESS IS AUTHORISED
+----------------------------------------------------------------
+- The host is closed to other devices until the owner turns on remote access.
+- Pairing requires a one-time six-digit code that is displayed on the host.
+- The owner chooses, per paired computer and per permission, whether the other
+  side may write files, run commands, or manage folders.
+- Every capability can be revoked from the host settings page at any time.
+- Nothing is enabled by default: a fresh install answers only on loopback and
+  accepts no remote device.
+
+
+INTENDED LEGITIMATE USE
+----------------------------------------------------------------
+Using one's own phone to operate one's own development computer: reading the
+session, replying to the agent, running commands, reviewing files, and getting
+notified when a long task finishes. The same plugin also lets the owner drive a
+second computer they own, and lets a paired phone be operated from the desktop.
+
+The typical user is a developer working on a personal machine, often away from
+the desk, who wants the same session on the phone without exposing the machine
+to the public internet.
+
+
+OUT OF SCOPE / NOT SUPPORTED
+----------------------------------------------------------------
+The package contains no persistence mechanism, no privilege escalation, no
+credential harvesting, no obfuscated payload, no executable binaries, and no
+mechanism for a third party to obtain access without the owner generating a
+pairing code on the host. It
+does not ship a keylogger, does not read files outside the authorised folders,
+and does not communicate with any server operated by the maintainer.
+
+It is also not a general-purpose tunnelling product sold as a service, and it
+does not ship exploits. If a future version ever gains a capability that could
+be read as an exploit or as a delivery mechanism for someone else's code, it
+will be documented here before it ships.
+
+
+CONTACT
+----------------------------------------------------------------
+Repository: https://github.com/xingzhen199186/dsh-everywhere
+Issues:     https://github.com/xingzhen199186/dsh-everywhere/issues

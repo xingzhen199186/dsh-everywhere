@@ -1,0 +1,646 @@
+package com.dsh.miniremote;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.net.Uri;
+import android.os.Build;
+import android.os.Environment;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * 手机上的文件能力，**全都跑在我们自己的 App 里**（2026-11-12）。
+ *
+ * 为什么不靠 Termux：用户不该为了用这个 App 再装一个 App。这里默认只用两种位置：
+ *   · `app:` 开头的路径 —— App 自己的私有目录，不需要任何权限，用户看不见；
+ *   · `work:` 开头的路径 —— 用户在系统选择器里**亲手选的一个文件夹**，之后归我们管。
+ *
+ * 另有一个**默认关闭的实验模式** `public:`：用户到系统设置手动授予
+ * 「所有文件访问」（MANAGE_EXTERNAL_STORAGE）后才可用。它能读公共目录里的普通
+ * 文档，但**仍然进不去**别的 App 的 Android/data；而且 Play 对上架应用申请这条
+ * 权限有严格限制。所以它只作为侧载/高级选项，默认路径始终是 app:/work:。
+ */
+final class NativeFiles {
+    static final String PREFS = "mini_ui_prefs";
+    static final String WORK_TREE = "work_tree_uri";
+    static final String WORK_NAME = "work_tree_name";
+
+    /** 单次读写的上限，避免一次塞爆通道或内存。 */
+    private static final int MAX_WRITE_CHARS = 60_000;
+    private static final int MAX_READ_CHARS = 200_000;
+    private static final int MAX_LIST = 500;
+
+    private NativeFiles() {
+    }
+
+    static String workUri(Context context) {
+        return prefs(context).getString(WORK_TREE, "");
+    }
+
+    static String workName(Context context) {
+        return prefs(context).getString(WORK_NAME, "");
+    }
+
+    static void setWork(Context context, Uri uri, String name) {
+        prefs(context).edit()
+                .putString(WORK_TREE, uri == null ? "" : uri.toString())
+                .putString(WORK_NAME, name == null ? "" : name)
+                .apply();
+    }
+
+    private static SharedPreferences prefs(Context context) {
+        return context.getApplicationContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    }
+
+    /** 给界面看的一句话状态。 */
+    static String describe(Context context) {
+        String name = workName(context);
+        return name.isEmpty() ? "" : name;
+    }
+
+    // ── 路径解析 ────────────────────────────────────────────────
+
+    /** 全盘模式：只有 API 30+ 且用户已在系统设置授予「所有文件访问」才为 true。 */
+    static boolean allFilesAllowed(Context context) {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                && Environment.isExternalStorageManager();
+    }
+
+    /** 公共存储根目录；调用前必须先确认 allFilesAllowed。 */
+    private static File publicRoot() {
+        return Environment.getExternalStorageDirectory();
+    }
+
+    /** 公共路径必须锁在公共根目录内，不能靠 ../ 跑到别处。 */
+    private static File publicFile(String rel) throws Exception {
+        File root = publicRoot();
+        File file = rel.isEmpty() ? root : new File(root, rel);
+        String rootPath = root.getCanonicalPath();
+        String filePath = file.getCanonicalPath();
+        if (!filePath.equals(rootPath) && !filePath.startsWith(rootPath + File.separator)) {
+            throw new IllegalArgumentException("路径越界：只能访问公共存储目录");
+        }
+        return file;
+    }
+
+    /** `app:`、`work:` 两种默认前缀；`public:` 仅在用户开启全盘模式后允许。 */
+    static JSONObject resolve(Context context, String path) throws Exception {
+        if (path == null || path.trim().isEmpty()) {
+            throw new IllegalArgumentException("路径是空的");
+        }
+        String p = path.trim();
+        if (p.startsWith("app:")) {
+            return new JSONObject().put("kind", "app").put("rel", strip(p.substring(4)));
+        }
+        if (p.startsWith("work:")) {
+            if (workUri(context).isEmpty()) {
+                throw new IllegalStateException("还没有选工作文件夹。请到「设置 → 屏幕操作 → 工作文件夹」选一个。");
+            }
+            return new JSONObject().put("kind", "work").put("rel", strip(p.substring(5)));
+        }
+        if (p.startsWith("public:")) {
+            if (!allFilesAllowed(context)) {
+                throw new IllegalStateException("全盘模式没有开启。请到 App 设置 →「全盘模式（实验）」打开，并在系统设置里允许「所有文件访问」。");
+            }
+            return new JSONObject().put("kind", "public").put("rel", strip(p.substring(7)));
+        }
+        throw new IllegalArgumentException("路径要以 app:、work: 或 public: 开头（例如 work:下载/a.txt）");
+    }
+
+    private static String strip(String value) {
+        String v = value == null ? "" : value.trim();
+        while (v.startsWith("/")) v = v.substring(1);
+        return v;
+    }
+
+    private static File appFile(Context context, String rel) {
+        return rel.isEmpty() ? context.getFilesDir() : new File(context.getFilesDir(), rel);
+    }
+
+    /** app/public 都是普通 File；work 走 SAF，返回 null。调用方先 resolve。 */
+    private static File plainFile(Context context, JSONObject target) throws Exception {
+        String kind = target.getString("kind");
+        String rel = target.getString("rel");
+        if ("app".equals(kind)) return appFile(context, rel);
+        if ("public".equals(kind)) return publicFile(rel);
+        return null;
+    }
+
+    /** 在 SAF 目录里按名字逐级找；找不到就返回 null。 */
+    private static androidx.documentfile.provider.DocumentFile walk(
+            Context context, String rel, boolean createMissing) {
+        Uri tree = Uri.parse(workUri(context));
+        androidx.documentfile.provider.DocumentFile dir =
+                androidx.documentfile.provider.DocumentFile.fromTreeUri(context, tree);
+        if (dir == null) return null;
+        if (rel.isEmpty()) return dir;
+        String[] parts = rel.split("/");
+        androidx.documentfile.provider.DocumentFile current = dir;
+        for (int i = 0; i < parts.length; i++) {
+            String name = parts[i];
+            if (name.isEmpty()) continue;
+            boolean last = i == parts.length - 1;
+            androidx.documentfile.provider.DocumentFile next = current.findFile(name);
+            if (next == null) {
+                if (!createMissing || last) return null;
+                next = current.createDirectory(name);
+                if (next == null) return null;
+            }
+            current = next;
+        }
+        return current;
+    }
+
+    // ── 四个动作 ────────────────────────────────────────────────
+
+    static String list(Context context, String path) {
+        try {
+            JSONObject target = resolve(context, path);
+            JSONArray items = new JSONArray();
+            int scanned = 0;
+            boolean truncated = false;
+            if (!"work".equals(target.getString("kind"))) {
+                File dir = plainFile(context, target);
+                if (dir == null) return err("这个目录不存在：" + path);
+                if (!dir.exists()) return err("这个目录不存在：" + path);
+                if (!dir.isDirectory()) return err("这不是目录：" + path);
+                File[] children = dir.listFiles();
+                if (children == null) return err("读不了这个目录");
+                for (File child : children) {
+                    if (scanned >= MAX_LIST) { truncated = true; break; }
+                    scanned++;
+                    items.put(new JSONObject()
+                            .put("name", child.getName())
+                            .put("dir", child.isDirectory())
+                            .put("size", child.isDirectory() ? 0 : child.length()));
+                }
+            } else {
+                androidx.documentfile.provider.DocumentFile dir =
+                        walk(context, target.getString("rel"), false);
+                if (dir == null || !dir.isDirectory()) return err("这个目录不存在或不是目录：" + path);
+                for (androidx.documentfile.provider.DocumentFile child : dir.listFiles()) {
+                    if (scanned >= MAX_LIST) { truncated = true; break; }
+                    scanned++;
+                    items.put(new JSONObject()
+                            .put("name", child.getName() == null ? "" : child.getName())
+                            .put("dir", child.isDirectory())
+                            .put("size", child.length()));
+                }
+            }
+            return new JSONObject().put("ok", true).put("path", path)
+                    .put("scope", target.getString("kind"))
+                    .put("scanned", scanned)
+                    .put("truncated", truncated)
+                    .put("complete", !truncated)
+                    .put("items", items).toString();
+        } catch (Exception e) {
+            return err(reason(e));
+        }
+    }
+
+    static String read(Context context, String path, int offset, int limit) {
+        try {
+            JSONObject target = resolve(context, path);
+            // 二进制文件（docx/zip/pdf 等）不能按文本读：先探一下是不是文本。
+            if (isBinaryPath(path)) {
+                return err("这是二进制文件（" + binaryKind(path) + "），不能按文本读。请用手机上的文件管理或文档应用打开，或先转成文本。");
+            }
+            List<String> lines = new ArrayList<>();
+            File plain = plainFile(context, target);
+            if (plain != null) {
+                if (!plain.exists() || plain.isDirectory()) return err("没有这个文件：" + path);
+                try (BufferedReader reader = new BufferedReader(
+                        new InputStreamReader(new FileInputStream(plain), StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = reader.readLine()) != null) lines.add(line);
+                }
+            } else {
+                androidx.documentfile.provider.DocumentFile file =
+                        walk(context, target.getString("rel"), false);
+                if (file == null || !file.isFile()) return err("没有这个文件：" + path);
+                try (InputStream in = context.getContentResolver().openInputStream(file.getUri())) {
+                    if (in == null) return err("打不开这个文件");
+                    BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+                    String line;
+                    while ((line = reader.readLine()) != null) lines.add(line);
+                }
+            }
+            int from = Math.max(0, offset - 1);
+            int to = Math.min(lines.size(), from + Math.max(1, limit));
+            StringBuilder text = new StringBuilder();
+            for (int i = from; i < to; i++) {
+                text.append(lines.get(i));
+                if (i < to - 1) text.append('\n');
+            }
+            String body = text.length() > MAX_READ_CHARS
+                    ? text.substring(0, MAX_READ_CHARS) : text.toString();
+            boolean truncated = text.length() > MAX_READ_CHARS;
+            return new JSONObject().put("ok", true).put("path", path)
+                    .put("scope", target.getString("kind"))
+                    .put("totalLines", lines.size())
+                    .put("from", from + 1).put("to", to)
+                    .put("truncated", truncated)
+                    .put("complete", !truncated && to >= lines.size())
+                    .put("text", body).toString();
+        } catch (Exception e) {
+            return err(reason(e));
+        }
+    }
+
+    /** 按扩展名判断是不是二进制文件；是的话拒绝按文本读。 */
+    private static boolean isBinaryPath(String path) {
+        String lower = path.toLowerCase(java.util.Locale.ROOT);
+        return lower.endsWith(".docx") || lower.endsWith(".doc")
+                || lower.endsWith(".xlsx") || lower.endsWith(".xls")
+                || lower.endsWith(".pptx") || lower.endsWith(".ppt")
+                || lower.endsWith(".pdf") || lower.endsWith(".zip")
+                || lower.endsWith(".rar") || lower.endsWith(".7z")
+                || lower.endsWith(".apk") || lower.endsWith(".aab")
+                || lower.endsWith(".jpg") || lower.endsWith(".jpeg")
+                || lower.endsWith(".png") || lower.endsWith(".gif")
+                || lower.endsWith(".mp3") || lower.endsWith(".mp4")
+                || lower.endsWith(".wav") || lower.endsWith(".avi")
+                || lower.endsWith(".mov") || lower.endsWith(".mkv");
+    }
+
+    private static String binaryKind(String path) {
+        String lower = path.toLowerCase(java.util.Locale.ROOT);
+        if (lower.endsWith(".docx") || lower.endsWith(".doc")) return "Word 文档";
+        if (lower.endsWith(".xlsx") || lower.endsWith(".xls")) return "Excel 表格";
+        if (lower.endsWith(".pptx") || lower.endsWith(".ppt")) return "PPT 演示";
+        if (lower.endsWith(".pdf")) return "PDF";
+        if (lower.endsWith(".zip") || lower.endsWith(".rar") || lower.endsWith(".7z")) return "压缩包";
+        if (lower.endsWith(".apk") || lower.endsWith(".aab")) return "安装包";
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png")
+                || lower.endsWith(".gif")) return "图片";
+        if (lower.endsWith(".mp3") || lower.endsWith(".wav")) return "音频";
+        if (lower.endsWith(".mp4") || lower.endsWith(".avi") || lower.endsWith(".mov")
+                || lower.endsWith(".mkv")) return "视频";
+        return "二进制";
+    }
+
+    static String write(Context context, String path, String content) {
+        try {
+            if (content != null && content.length() > MAX_WRITE_CHARS) {
+                return err("内容太长（超过 6 万字符），分成几次写。");
+            }
+            JSONObject target = resolve(context, path);
+            String body = content == null ? "" : content;
+            File plain = plainFile(context, target);
+            if (plain != null) {
+                File parent = plain.getParentFile();
+                if (parent != null && !parent.exists() && !parent.mkdirs()) return err("建不了上级目录");
+                try (FileOutputStream out = new FileOutputStream(plain, false)) {
+                    out.write(body.getBytes(StandardCharsets.UTF_8));
+                }
+                return new JSONObject().put("ok", true).put("path", path)
+                        .put("bytes", plain.length()).toString();
+            }
+            String rel = target.getString("rel");
+            int slash = rel.lastIndexOf('/');
+            String dirRel = slash < 0 ? "" : rel.substring(0, slash);
+            String name = slash < 0 ? rel : rel.substring(slash + 1);
+            if (name.isEmpty()) return err("路径要以文件名结尾");
+            androidx.documentfile.provider.DocumentFile dir = walk(context, dirRel, true);
+            if (dir == null || !dir.isDirectory()) return err("建不了上级目录");
+            androidx.documentfile.provider.DocumentFile file = dir.findFile(name);
+            if (file == null) file = dir.createFile("text/plain", name);
+            if (file == null) return err("建不了这个文件");
+            try (OutputStream out = context.getContentResolver().openOutputStream(file.getUri(), "wt")) {
+                if (out == null) return err("打不开这个文件写");
+                out.write(body.getBytes(StandardCharsets.UTF_8));
+            }
+            return new JSONObject().put("ok", true).put("path", path)
+                    .put("bytes", body.getBytes(StandardCharsets.UTF_8).length).toString();
+        } catch (Exception e) {
+            return err(reason(e));
+        }
+    }
+
+    static String edit(Context context, String path, String from, String to) {
+        try {
+            if (from == null || from.isEmpty()) return err("要指定 old（要被替换掉的原文）");
+            String current = read(context, path, 1, Integer.MAX_VALUE / 4);
+            JSONObject parsed = new JSONObject(current);
+            if (!parsed.optBoolean("ok")) return current;
+            String text = parsed.optString("text", "");
+            int first = text.indexOf(from);
+            if (first < 0) return err("文件里没有找到要替换的文字");
+            if (text.indexOf(from, first + from.length()) >= 0) {
+                return err("要替换的文字出现了不止一次，先写得更具体一些");
+            }
+            String next = text.substring(0, first) + (to == null ? "" : to) + text.substring(first + from.length());
+            return write(context, path, next);
+        } catch (Exception e) {
+            return err(reason(e));
+        }
+    }
+
+
+    // ── 找文件 / 搜内容 ────────────────────────────────────────
+
+    /** 目录最多往下走几层，避免在超大目录里跑很久。 */
+    private static final int MAX_DEPTH = 8;
+    /** 一次最多返回多少条命中。 */
+    private static final int MAX_HITS = 300;
+    /** 搜内容时最多翻多少个文件、单文件多大。 */
+    private static final int MAX_SCAN_FILES = 500;
+    private static final long MAX_SCAN_BYTES = 256 * 1024;
+
+    /** 把 *.txt 这种通配符翻成正则；只支持 * 和 ?。 */
+    private static java.util.regex.Pattern globToRegex(String glob) {
+        StringBuilder sb = new StringBuilder("^");
+        for (char c : glob.toCharArray()) {
+            if (c == '*') sb.append(".*");
+            else if (c == '?') sb.append('.');
+            else sb.append(java.util.regex.Pattern.quote(String.valueOf(c)));
+        }
+        return java.util.regex.Pattern.compile(sb.append('$').toString());
+    }
+
+    static String glob(Context context, String path, String pattern) {
+        try {
+            JSONObject target = resolve(context, path);
+            java.util.regex.Pattern rx = globToRegex(pattern == null || pattern.isEmpty() ? "*" : pattern);
+            JSONArray hits = new JSONArray();
+            int[] scanned = {0};
+            boolean truncated = false;
+            File plain = plainFile(context, target);
+            if (plain != null) {
+                truncated = walkApp(plain, "", 0, rx, hits, scanned);
+            } else {
+                androidx.documentfile.provider.DocumentFile dir =
+                        walk(context, target.getString("rel"), false);
+                if (dir == null || !dir.isDirectory()) return err("这个目录不存在或不是目录：" + path);
+                truncated = walkTree(dir, "", 0, rx, hits, scanned);
+            }
+            return new JSONObject().put("ok", true)
+                    .put("scope", target.getString("kind"))
+                    .put("scanned", scanned[0])
+                    .put("truncated", truncated)
+                    .put("complete", !truncated)
+                    .put("count", hits.length()).put("files", hits).toString();
+        } catch (Exception e) {
+            return err(reason(e));
+        }
+    }
+
+    private static boolean walkApp(File dir, String prefix, int depth,
+                                 java.util.regex.Pattern rx, JSONArray hits, int[] scanned) {
+        if (dir == null) return false;
+        // 深度上限是“没搜完”，不是“搜完了没命中”。
+        if (depth > MAX_DEPTH) return true;
+        if (hits.length() >= MAX_HITS) return true;
+        File[] children = dir.listFiles();
+        // 读不了（权限、IO）意味着这一段没搜到：必须算"没搜完"，不能当作正常结束。
+        if (children == null) return true;
+        for (File child : children) {
+            if (hits.length() >= MAX_HITS) return true;
+            scanned[0]++;
+            String rel = prefix.isEmpty() ? child.getName() : prefix + "/" + child.getName();
+            if (child.isDirectory()) {
+                if (walkApp(child, rel, depth + 1, rx, hits, scanned)) return true;
+            } else if (rx.matcher(child.getName()).matches()) {
+                hits.put(rel + "\t" + child.length());
+            }
+        }
+        return false;
+    }
+
+    private static boolean walkTree(androidx.documentfile.provider.DocumentFile dir, String prefix,
+                                  int depth, java.util.regex.Pattern rx, JSONArray hits, int[] scanned) {
+        if (dir == null) return false;
+        if (depth > MAX_DEPTH) return true;
+        if (hits.length() >= MAX_HITS) return true;
+        for (androidx.documentfile.provider.DocumentFile child : dir.listFiles()) {
+            if (hits.length() >= MAX_HITS) return true;
+            scanned[0]++;
+            String name = child.getName() == null ? "" : child.getName();
+            String rel = prefix.isEmpty() ? name : prefix + "/" + name;
+            if (child.isDirectory()) {
+                if (walkTree(child, rel, depth + 1, rx, hits, scanned)) return true;
+            } else if (rx.matcher(name).matches()) {
+                hits.put(rel + "\t" + child.length());
+            }
+        }
+        return false;
+    }
+
+    static String grep(Context context, String path, String pattern) {
+        try {
+            if (pattern == null || pattern.isEmpty()) return err("要指定 pattern");
+            JSONObject target = resolve(context, path);
+            JSONArray hits = new JSONArray();
+            int[] budget = {MAX_SCAN_FILES};
+            int[] scanned = {0};
+            boolean truncated = false;
+            File plain = plainFile(context, target);
+            if (plain != null) {
+                truncated = grepApp(plain, "", 0, pattern, hits, budget, scanned);
+            } else {
+                androidx.documentfile.provider.DocumentFile dir =
+                        walk(context, target.getString("rel"), false);
+                if (dir == null) return err("这个位置不存在：" + path);
+                truncated = grepTree(context, dir, "", 0, pattern, hits, budget, scanned);
+            }
+            return new JSONObject().put("ok", true)
+                    .put("scope", target.getString("kind"))
+                    .put("scanned", scanned[0])
+                    .put("truncated", truncated)
+                    .put("complete", !truncated)
+                    .put("count", hits.length()).put("matches", hits).toString();
+        } catch (Exception e) {
+            return err(reason(e));
+        }
+    }
+
+    private static boolean grepApp(File dir, String prefix, int depth, String pattern,
+                                 JSONArray hits, int[] budget, int[] scanned) {
+        if (dir == null) return false;
+        if (depth > MAX_DEPTH || hits.length() >= MAX_HITS || budget[0] <= 0) return true;
+        File[] children = dir.listFiles();
+        // 同上：读不了的目录要算"没搜完"。
+        if (children == null) return true;
+        for (File child : children) {
+            if (hits.length() >= MAX_HITS || budget[0] <= 0) return true;
+            scanned[0]++;
+            String rel = prefix.isEmpty() ? child.getName() : prefix + "/" + child.getName();
+            if (child.isDirectory()) {
+                if (grepApp(child, rel, depth + 1, pattern, hits, budget, scanned)) return true;
+            } else if (child.length() <= MAX_SCAN_BYTES) {
+                budget[0]--;
+                scanFile(child.getName(), rel, readLinesApp(child), pattern, hits);
+            }
+        }
+        return false;
+    }
+
+    private static boolean grepTree(Context context, androidx.documentfile.provider.DocumentFile dir,
+                                  String prefix, int depth, String pattern, JSONArray hits, int[] budget, int[] scanned) {
+        if (dir == null) return false;
+        if (depth > MAX_DEPTH || hits.length() >= MAX_HITS || budget[0] <= 0) return true;
+        for (androidx.documentfile.provider.DocumentFile child : dir.listFiles()) {
+            if (hits.length() >= MAX_HITS || budget[0] <= 0) return true;
+            scanned[0]++;
+            String name = child.getName() == null ? "" : child.getName();
+            String rel = prefix.isEmpty() ? name : prefix + "/" + name;
+            if (child.isDirectory()) {
+                if (grepTree(context, child, rel, depth + 1, pattern, hits, budget, scanned)) return true;
+            } else if (child.length() <= MAX_SCAN_BYTES) {
+                budget[0]--;
+                scanFile(name, rel, readLinesUri(context, child.getUri()), pattern, hits);
+            }
+        }
+        return false;
+    }
+
+    private static void scanFile(String name, String rel, List<String> lines, String pattern, JSONArray hits) {
+        if (lines == null) return;
+        java.util.regex.Pattern rx = null;
+        try {
+            rx = java.util.regex.Pattern.compile(pattern, java.util.regex.Pattern.CASE_INSENSITIVE);
+        } catch (Exception ignored) {
+            // 不是合法正则就按普通文字找。
+        }
+        for (int i = 0; i < lines.size() && hits.length() < MAX_HITS; i++) {
+            String line = lines.get(i);
+            boolean match = rx != null ? rx.matcher(line).find() : line.contains(pattern);
+            if (!match) continue;
+            try {
+                hits.put(new JSONObject().put("file", rel).put("line", i + 1).put("text", line));
+            } catch (Exception ignored) {
+                // 单条拼不进 JSON 就跳过，不影响别的命中。
+            }
+        }
+    }
+
+    private static List<String> readLinesApp(File file) {
+        List<String> lines = new ArrayList<>();
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(new FileInputStream(file), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = reader.readLine()) != null) lines.add(line);
+        } catch (Exception e) {
+            return null;
+        }
+        return lines;
+    }
+
+    private static List<String> readLinesUri(Context context, Uri uri) {
+        List<String> lines = new ArrayList<>();
+        try (InputStream in = context.getContentResolver().openInputStream(uri)) {
+            if (in == null) return null;
+            BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8));
+            String line;
+            while ((line = reader.readLine()) != null) lines.add(line);
+        } catch (Exception e) {
+            return null;
+        }
+        return lines;
+    }
+
+    // ── 打开文件 ───────────────────────────────────────────────
+
+    /**
+     * 用系统应用打开一个文件（2026-11-17）。
+     *
+     * work: 路径用 DocumentFile 拿 content:// URI；app: 路径用 FileProvider。
+     * 只读动作，不修改文件；返回 {ok, path, uri, mime, opened}。
+     */
+    static String openFile(Context context, String path) {
+        try {
+            JSONObject target = resolve(context, path);
+            String rel = target.getString("rel");
+            Uri uri;
+            String mime = mimeOf(rel);
+            File plain = plainFile(context, target);
+            if (plain != null) {
+                if (!plain.exists() || plain.isDirectory()) return err("没有这个文件：" + path);
+                uri = androidx.core.content.FileProvider.getUriForFile(
+                        context, context.getPackageName() + ".fileprovider", plain);
+            } else {
+                androidx.documentfile.provider.DocumentFile file = walk(context, rel, false);
+                if (file == null || !file.isFile()) return err("没有这个文件：" + path);
+                uri = file.getUri();
+            }
+            android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, mime);
+            intent.addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION);
+            intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+            try {
+                context.startActivity(intent);
+            } catch (Exception err) {
+                return err("打不开这个文件：没有能处理 " + mime + " 的应用");
+            }
+            return new JSONObject().put("ok", true).put("path", path)
+                    .put("uri", uri.toString()).put("mime", mime).put("opened", true).toString();
+        } catch (Exception e) {
+            return err(reason(e));
+        }
+    }
+
+    /** 按扩展名给 MIME；认不出的用 application/octet-stream。 */
+    private static String mimeOf(String name) {
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        if (lower.endsWith(".docx")) return "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+        if (lower.endsWith(".doc")) return "application/msword";
+        if (lower.endsWith(".xlsx")) return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+        if (lower.endsWith(".xls")) return "application/vnd.ms-excel";
+        if (lower.endsWith(".pptx")) return "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+        if (lower.endsWith(".ppt")) return "application/vnd.ms-powerpoint";
+        if (lower.endsWith(".pdf")) return "application/pdf";
+        if (lower.endsWith(".txt")) return "text/plain";
+        if (lower.endsWith(".md")) return "text/markdown";
+        if (lower.endsWith(".json")) return "application/json";
+        if (lower.endsWith(".xml")) return "application/xml";
+        if (lower.endsWith(".zip")) return "application/zip";
+        if (lower.endsWith(".rar")) return "application/vnd.rar";
+        if (lower.endsWith(".7z")) return "application/x-7z-compressed";
+        if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
+        if (lower.endsWith(".png")) return "image/png";
+        if (lower.endsWith(".gif")) return "image/gif";
+        if (lower.endsWith(".mp3")) return "audio/mpeg";
+        if (lower.endsWith(".wav")) return "audio/wav";
+        if (lower.endsWith(".mp4")) return "video/mp4";
+        if (lower.endsWith(".avi")) return "video/x-msvideo";
+        if (lower.endsWith(".mov")) return "video/quicktime";
+        if (lower.endsWith(".mkv")) return "video/x-matroska";
+        if (lower.endsWith(".apk")) return "application/vnd.android.package-archive";
+        return "application/octet-stream";
+    }
+
+    // ── 小工具 ─────────────────────────────────────────────────
+
+
+    private static String err(String message) {
+        try {
+            return new JSONObject().put("ok", false).put("error", message).toString();
+        } catch (Exception ignored) {
+            return "{\"ok\":false}";
+        }
+    }
+
+    /** 把系统异常翻成人话，别把整段堆栈丢给模型。 */
+    private static String reason(Exception e) {
+        if (e instanceof IllegalStateException || e instanceof IllegalArgumentException) {
+            return e.getMessage() == null ? "参数不对" : e.getMessage();
+        }
+        String name = e.getClass().getSimpleName();
+        String msg = e.getMessage() == null ? "" : e.getMessage();
+        if (name.contains("Security")) return "没有权限访问这个位置（如果刚授权过，重新选一次文件夹）";
+        if (name.contains("FileNotFound")) return "没有这个文件或目录";
+        return (name + " " + msg).trim();
+    }
+}

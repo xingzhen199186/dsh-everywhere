@@ -1,0 +1,328 @@
+<div align="center">
+
+# DSH Everywhere · dsh-everywhere
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/promo.webp" alt="Minimal Remote: view instructions, conclusions, and execution details on your phone when you need them" width="720" />
+</p>
+
+**Use DeepSeek Harness anywhere, and change the world.**
+
+[![GitHub Release](https://img.shields.io/github/v/release/xingzhen199186/dsh-everywhere)](https://github.com/xingzhen199186/dsh-everywhere/releases/latest)
+[![Node.js](https://img.shields.io/badge/node-%5E22.19.0%20%7C%7C%20%3E%3D24.0.0-brightgreen)](https://nodejs.org/)
+[![DSH](https://img.shields.io/badge/DSH-%3E%3D0.1.5--rc.2%20%3C0.3.0-blue)](https://github.com/deepseek-ai/DeepSeek-Harness)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+[English](README.en.md) · [简体中文](README.md)
+
+</div>
+
+<p align="center">
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#dsh-everywhere-app">App</a> ·
+  <a href="#ai-setup-guide">AI Setup</a> ·
+  <a href="#connection-routes">Connection Routes</a> ·
+  <a href="#core-capabilities">Core Capabilities</a> ·
+  <a href="#settings">Settings</a> ·
+  <a href="#troubleshooting">Troubleshooting</a> ·
+  <a href="#security-boundaries">Security Boundaries</a> ·
+  <a href="#documentation">Documentation</a>
+</p>
+
+---
+
+## What It Is
+
+DSH Everywhere is a plugin for [DeepSeek Harness (DSH)](https://github.com/deepseek-ai/DeepSeek-Harness). The phone app and computer plugin share one name and solve three problems:
+
+- **Phone control**: switch between Single frame, Chat, and Full modes in a phone browser to view sessions, send instructions, answer questions, or handle approvals, without squeezing the entire desktop interface onto a small screen.
+- **Remote Window**: open this computer's complete DSH interface inside another computer's DSH desktop.
+- **A/B cross-computer work**: Work on computer B using the DSH on computer A. A keeps the session and model and uses `b_*` tools to read or write files and run commands on B; B decides locally what is allowed.
+
+Connection routes range from LAN and Tailscale to fixed addresses and self-hosted relays. If network setup is unfamiliar, the built-in AI guide can walk you through it.
+
+---
+
+## Quick Start
+
+### Requirements
+
+- **Node.js**: `^22.19.0 || >=24.0.0`
+- **DSH**: `>=0.1.5-rc.2 <0.3.0`
+- **Operating system**: Windows, macOS, or Linux
+
+This version has been re-checked against DSH `0.2.2-rc.3`. See [CHANGELOG.md](CHANGELOG.md) for release history.
+
+### Installation
+
+Install from the **GitHub repository, the tgz attached to a Release, or a local directory**. `web` is the default DSH profile; replace it when using a custom profile.
+
+#### Option 1: GitHub repository (recommended)
+
+Enter `github:xingzhen199186/dsh-everywhere` in **Plugins → Add Plugin**, or run:
+
+```powershell
+dsh plugin --profile web add github:xingzhen199186/dsh-everywhere
+```
+
+#### Option 2: Release tgz
+
+Download `dsh-everywhere-0.3.1.tgz` from [GitHub Releases](https://github.com/xingzhen199186/dsh-everywhere/releases/latest), then select it in **Add Plugin** or run:
+
+```powershell
+dsh plugin --profile web add C:\path\to\dsh-everywhere-0.3.1.tgz
+```
+
+#### Option 3: Local directory
+
+For development, enter the absolute directory path in **Add Plugin**, or run:
+
+```powershell
+dsh plugin --profile web add C:\path\to\dsh-everywhere
+```
+
+> **Verify the source.** Plugins run with the current user's full privileges. Uninstall the previous version before upgrading; automatic updates are not supported.
+
+### Migrating from dsh-mini-remote
+
+1. Install `dsh-everywhere` using one of the sources above.
+2. Uninstall the old `dsh-mini-remote` in the DSH plugin page, then restart or reload DSH when prompted. Do not enable both plugins at once.
+3. Pair phones and computers again and check tunnel, Feishu, and relay settings.
+
+The plugin data directory changed from `$DSH_HOME/dsh-mini-remote` to `$DSH_HOME/dsh-everywhere`. **Old settings are not inherited automatically**, so pairing and configuration must be reviewed again. The Android app remains compatible because its application ID and signing identity are unchanged.
+
+### Package contents and on-demand downloads
+
+- **The npm tgz is about 2.5 MB and contains no executable files.** `frpc.exe` and `relay-server` are distributed through this repository and Releases instead.
+- **First Cloudflare tunnel use:** cloudflared (about 50 MB) is downloaded from Cloudflare's official GitHub releases, with mirror fallbacks.
+- **First self-hosted relay use:** frpc (about 16 MB) is downloaded from this project's Releases and checked against a SHA-256 hash pinned in the source; mismatches are discarded.
+- The plugin has dual-use capabilities. Their intended uses, defaults, and authorization boundaries are declared in `contentPolicy` in [package.json](package.json) and in [DISCLOSURE](DISCLOSURE).
+
+### Start and Confirm the Service
+
+1. Restart the DSH service: close the current `dsh web` window and start it again.
+2. Check the console for initialization output and the listening port:
+
+   ```text
+   [dsh-everywhere] started: http://127.0.0.1:3090/mini
+   ```
+
+3. Open the DSH desktop UI and go to **Settings** → **Remote Settings** to see the pairing QR codes and connection details.
+
+> **The phone client has two forms: the browser page, or the Android app DSH Everywhere.** The browser page works on any phone after a scan. The Android app adds lock-screen notifications, quick approvals, system sharing, and embedded Tailscale. See [DSH Everywhere](docs/DSH-Everywhere.md). You can also add the page to the home screen; it opens full-screen from the icon but still runs in the browser. Changing phones or clearing browser data requires pairing again.
+>
+> The same address also works in a PC browser. After enabling **Advanced Settings**, the complete DSH desktop interface is available there as well.
+>
+> **How to confirm startup:** **Remote Settings** shows a title, connection addresses, and QR codes, and the console prints a line beginning with `[dsh-everywhere] 已启动`. If the console is ready but the settings page is empty, refresh or restart DSH, then check **Diagnostics & Advanced** → **Self-check**.
+
+### Connect a Phone
+
+1. Open DSH **Settings** → **Remote Settings**. The **Phone Connection** section at the top is always visible.
+2. If the phone and computer are on the same Wi-Fi, scan the **LAN** QR code.
+3. If you are not sure which route to use, click **Let AI guide me** at the top and follow the prompts.
+4. The phone page opens the session list, and the phone appears under **Computers & Devices** on the computer: the connection is working.
+
+> **A pairing link is an entry credential.** The QR code and copied link contain a one-time pairing grant valid for 5 minutes. After pairing, the long-lived credential stays in an HttpOnly cookie and never appears in the URL. An unused link can still enroll a device, so do not send screenshots, project the page, or paste it in public. After a device is revoked, scan again.
+
+---
+
+## Preview
+
+### Conversation views (Single frame / Chat / Full)
+
+The phone page is built with vanilla JavaScript and has no front-end build step. It provides two high-contrast themes: deep ocean blue (dark) and ice blue with royal blue (light). One conversation can be read three ways: Single frame leaves only the latest conclusion on screen, Chat arranges history as bubbles, and Full puts each turn's execution trail back in place:
+
+<div align="center">
+  <img width="290" alt="Chat (dark): turns arranged as back-and-forth bubbles, with several visible at once" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/screen-chat-dark.png" />
+  <img width="290" alt="Chat (light): the same conversation in the light theme" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/screen-chat-light.png" />
+</div>
+
+### Settings and appearance
+
+Use the settings button in the upper-right corner to switch presentation mode, theme, and network reconnection controls:
+
+<div align="center">
+  <img width="290" alt="Settings (dark): three display modes with dark appearance selected" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/settings-dark.png" />
+  <img width="290" alt="Settings (light): selected states and the primary button use royal blue" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/settings-light.png" />
+</div>
+
+### Execution status
+
+During a task, the page shows the animated running state, an elapsed timer, and the queue scale without inventing progress that is not known:
+
+<div align="center">
+  <img width="290" alt="Running (dark): the whale mascot running, 14 seconds elapsed, one instruction on the queue scale" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/running-dark-phone.jpg" />
+  <img width="290" alt="Running (light): the same run in the light theme, 14 seconds elapsed, one instruction queued" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/running-light-phone.jpg" />
+</div>
+
+### Remote Window
+
+Open this computer's complete DSH interface directly inside another computer's DSH desktop:
+
+<div align="center">
+  <img width="680" alt="Remote Window: the complete interface embedded in another computer's DSH panel" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/remote-window.png" />
+</div>
+
+---
+
+## DSH Everywhere App
+
+If you would rather not open a browser every time, or you need **approvals on the lock screen, system sharing from other apps into DSH, or the computer to operate the phone screen directly**, install the Android companion app **DSH Everywhere**.
+
+The Android app and the plugin now share the name **DSH Everywhere**. They are not separate products: connections, sessions, and permissions are shared with the web page, while the model and files stay on the computer. **The application ID remains `com.dsh.miniremote` for historical compatibility**; the signing alias and APK naming rules are unchanged so existing users can update in place.
+
+> **Before using the app, install and start `dsh-everywhere` 0.3.0 or newer on the computer.** Earlier plugin versions do not provide the pairing, address-pool, and update interfaces the app needs.
+
+| Package | What it includes |
+| :--- | :--- |
+| `DSH-Everywhere-0.1.0.apk` | **One complete build**: pairing, sessions, notifications, quick approvals, system sharing, embedded Tailscale, and optional screen operation. The accessibility permission is needed only when you enable screen operation |
+
+- **Download**: [latest GitHub Release](https://github.com/xingzhen199186/dsh-everywhere/releases/latest)
+- **Requirements**: Android 9 or newer, arm64 phone; the plugin installed and running on the computer
+- **DSH always runs on the computer, not on the phone.** The browser page and DSH Everywhere are remote entry points only: the model, session engine, and session files stay on the computer. The phone cannot run DSH on its own, and cannot continue when the computer is off or offline.
+- **Full guide (Chinese)**: [DSH Everywhere](docs/DSH-Everywhere.md)
+
+If you want full tools like Python, Node, git, ssh, or ffmpeg on the phone, you can install the official Termux app alongside DSH Everywhere; Termux is not required—the app works without it. The app still requires plugin 0.3.0+. See the [Termux section](docs/DSH-Everywhere.md#termux) in the full guide.
+
+The app can run phone commands two ways: **wireless debugging** (lightweight, recommended) or **Termux** (optional, full Linux environment). When both are available, wireless debugging is preferred and Termux serves as the fallback and full environment. See [Phone commands: wireless debugging and Termux](docs/DSH-Everywhere.md#手机命令无线调试与-termux) in the full guide.
+
+**You can also use the phone browser without the app.** Open **Settings → Remote Settings** on the computer, then scan the QR code (or open the pairing link manually) on the phone; iOS, tablets, and borrowed phones use this web route. See [10-Phone Connection and Passphrase](docs/guide/10-手机连接与密码.md) for the full steps.
+
+---
+
+## AI Setup Guide
+
+The plugin package already contains the `dsh-everywhere-setup` skill and the [docs/guide/](docs/guide/) knowledge base. **No separate skill installation is needed.**
+
+1. In **Remote Settings**, click **Let AI guide me** at the top. The plugin opens a new session and fills in the setup prompt; the guide starts after you press Send.
+2. You can also say **“Help me set up phone control”** in any session, or describe a concrete problem such as **“My phone cannot connect”** or **“I need a fixed address.”**
+3. The guide first calls the read-only `mini_remote_status` tool to inspect ports, addresses, tunnels, and relay states. It then picks a route and **asks one question at a time**.
+4. Each step tells you where to click and what you should see afterwards. If the current environment cannot open a new session, the button copies the prompt so you can paste it into a new session.
+
+It covers phone connection and passphrases, every connection route, computers and devices, A/B collaboration, B projects, Feishu, self-check and advanced settings, Remote Window, and configuration timing.
+
+The guide prefers the version-matched local `docs/guide/`; it falls back to the GitHub repository only when local documentation is unavailable.
+
+**Safety boundaries:** it does not read or repeat passphrases, tokens, frp tokens, or device credentials; it does not restart DSH; it does not delete devices, revoke tenants, or delete server resources; and it does not modify Cloudflare, firewalls, DNS, or domain records. High-risk actions are described as steps for you to confirm.
+
+---
+
+## Connection Routes
+
+Pick one route that works before adding a fixed address. Use LAN when the phone and computer share a Wi-Fi network; for other cases, choose based on whether you can install a client and whether you need a fixed address.
+
+| Route | Best for | Requirements and trade-offs | Details |
+| :--- | :--- | :--- | :--- |
+| **LAN** | Same Wi-Fi network | No extra dependency; plain HTTP; stops working when you leave the network | [01-LAN](docs/guide/01-内网.md) |
+| **Tailscale** | Remote use with a client installed | Both devices sign in to the same account; optional HTTPS depends on MagicDNS | [02-Tailscale](docs/guide/02-Tailscale.md) |
+| **Cloudflare public** | Temporary access, or a fixed address with your own domain | Temporary address changes after each restart; a fixed address needs a Cloudflare account and domain; traffic goes through Cloudflare | [03-Public Tunnel](docs/guide/03-公网隧道.md) |
+| **Manual public address** | You already run Tailscale Funnel, a reverse proxy, or another public entry | The plugin only displays the address and QR code; it does not create, probe, or repair the link. The entry itself must open `/mini`; Tailscale Funnel supports only ports 443, 8443, and 10000 | [04-Manual Public Address](docs/guide/04-手动公网地址.md) |
+| **Shared fixed address** | A fixed URL without running a server | Requires a quick tunnel and a provider invite code (valid for 30 minutes by default; see details); traffic goes through a shared relay and is not end-to-end encrypted | [05-Shared Fixed Address](docs/guide/05-共享固定地址.md) |
+| **Dedicated fixed address** | A provider assigns a fixed domain or enables self-service | One-time activation code (valid for 30 minutes by default; see details); the provider creates a named tunnel; stopping does not delete server resources | [06-Dedicated Fixed Address](docs/guide/06-专属固定地址.md) |
+| **Self-hosted relay (single user)** | You have your own server and domain | Requires your own public server and your own domain; two hostnames and an frp token; fixed address; you maintain the server and certificate | [07-Self-hosted Relay](docs/guide/07-自建中继.md) |
+| **Self-hosted multi-user relay** | Several people each need access, and you have a server and domain | Requires your own public server and your own domain; an administrator deploys `relay-multi` and issues invite tickets; traffic goes only through that server | [08-Multi-user Relay](docs/guide/08-自建多用户中继.md) |
+| **Feishu** | Control through enterprise IM only | Configure a Feishu custom app; no inbound public port; currently text and approvals in direct messages | [14-Feishu](docs/guide/14-飞书通知.md) |
+
+Invite codes for the shared and dedicated fixed addresses are issued by the provider. If you do not have one, use the application entry the provider gives you; the plugin does not offer public registration.
+
+
+---
+
+## Core Capabilities
+
+- **Phone page**: Single frame, Chat, and Full views; queueing, slash commands, question cards, approvals, and session management. See [10-Phone Connection and Passphrase](docs/guide/10-手机连接与密码.md).
+- **DSH Everywhere app**: an Android entry point for the same page, adding lock-screen notifications, quick approvals, system sharing, embedded Tailscale, and phone commands via wireless debugging (with optional Termux for a full Linux environment). See [DSH Everywhere](docs/DSH-Everywhere.md).
+- **Remote Window**: Open this computer's complete DSH interface inside another computer's DSH desktop. See [16-Remote Window](docs/guide/16-远程窗口.md).
+- **A/B collaboration**: A uses `b_*` tools on B; B controls directories, writes, folder operations, and command permission locally. Re-pairing reuses the existing record via `machine-id`. See [12-A/B Collaboration](docs/guide/12-A-B端协作.md).
+- **B projects**: Register a real B directory as an A workspace without copying files; includes a B file panel and **New B Session**. See [13-B Projects](docs/guide/13-B项目.md).
+- **Bidirectional Feishu**: Text, question, and approval replies over the long connection. See [14-Feishu](docs/guide/14-飞书通知.md).
+- **Device management**: Phones and computers are registered separately; rename or revoke them. The roster holds at most 5 devices, and a device idle for 30 days is removed automatically. Revoked devices must scan again. See [11-Computers and Devices](docs/guide/11-电脑与设备.md).
+
+---
+
+## Settings
+
+**Phone Connection** at the top is always visible. The five groups below are collapsed by default, and so are their inner sections (for example, each route under **Connection & Fixed Addresses**).
+
+| Area | Main contents |
+| :--- | :--- |
+| **Phone Connection** | Addresses, QR codes, passphrase |
+| **Connection & Fixed Addresses** | Tailscale, public access, shared fixed, dedicated fixed, self-hosted relay, multi-user relay, Tailscale HTTPS |
+| **Computers & Devices** | Allow other computers, device list, other computers |
+| **A/B Collaboration** | As A, as B, B projects |
+| **Notifications & Integrations** | Feishu, credentials, allowlists, setup guide |
+| **Diagnostics & Advanced** | Self-check, recent errors |
+
+For full settings details, see [15-Self-check and Advanced Settings](docs/guide/15-自检与进阶设置.md) and [17-Parameters and Timing](docs/guide/17-参数与生效方式.md).
+
+---
+
+## Troubleshooting
+
+| Symptom | Check first |
+| :--- | :--- |
+| B says it is not connected to A | Wait for one 5-second refresh cycle, then press `Ctrl+F5`; if it still fails, check A's address, switches, and port |
+| Remote Window returns HTTP 502 | On A, run `tailscale serve status`; the proxy should target the current phone-service port, normally `3090`, not the old `3091` |
+| A fixed address or relay will not connect | Check the status, whether the invite ticket or activation code was already used, and whether the server resource still exists |
+| The phone page is inaccessible after revocation | The device authorization was removed; scan again from **Remote Settings** |
+
+`tailscale serve status` should show a target similar to:
+
+```text
+https://<machine>.<tailnet>.ts.net
+  -> http://127.0.0.1:3090
+```
+
+If `3090` is occupied, use the listening port shown under **Diagnostics & Advanced** → **Self-check**. To reconfigure, turn **Tailscale HTTPS** off and on again under **Connection & Fixed Addresses**.
+
+See [09-When It Will Not Connect](docs/guide/09-连不上怎么办.md) for the full symptom table and checks.
+
+---
+
+## Security Boundaries
+
+- **Addresses and devices**: the QR code and copied link contain a one-time pairing grant valid for 5 minutes. The long-lived credential stays in an HttpOnly cookie and never enters the URL. Revoked devices must scan again; do not publish QR codes, passphrases, or unused pairing links.
+- **Public and third-party routes**: Cloudflare, the shared fixed relay, and the dedicated B relay send traffic through a third party; a changing temporary hostname is not a security boundary. Self-hosted and multi-user relays also let the server operator see plaintext.
+- **Plugin permissions**: the plugin runs with the current user's privileges. Install only packages from trusted sources; an untrusted plugin can read files or leak credentials.
+- **Full interface**: **Advanced Settings** and Remote Window expose the complete DSH management plane, including model configuration, credentials, plugins, and session history. Enable them only for trusted devices.
+- **Command execution**: phone **Full access** and B-side command permission can run system commands. The model-level `confirm` is not a human approval; the real boundary is the local permission switch.
+- **Resource cleanup**: stopping a connection or clearing local configuration does not delete server resources. Fixed addresses, tenants, and tunnels must be reclaimed according to the relevant guide.
+- **Public deployment**: this plugin does not promise a secure public deployment. Assess the network, access control, and host security before enabling public or third-party relay access.
+
+---
+
+## Development & Verification
+
+```bash
+npm test
+node client/verify.mjs
+```
+
+- `npm test`: offline tests; DSH does not need to be running.
+- `node client/verify.mjs`: verifies the client module, settings page, two-level collapsing, Remote Window, and B project panel.
+- Use the command output as the source of truth.
+- Run `npm pack --dry-run` before release to inspect the package contents.
+
+See [CHANGELOG.md](CHANGELOG.md) for detailed changes.
+
+---
+
+## Documentation
+
+- **Full guide**: [docs/guide/](docs/guide/) (00–17). Connection, passphrases, devices, A/B, B projects, Feishu, self-check, Remote Window, and parameters are all here.
+- **Phone app**: [DSH Everywhere](docs/DSH-Everywhere.md). Download, installation, build variants, permissions, and troubleshooting.
+- **AI guide**: [SKILL.md](SKILL.md).
+- **Self-hosted relay server**: [relay-server/README.md](relay-server/README.md).
+- **Multi-user relay server**: [relay-multi/README.md](relay-multi/README.md).
+- **Project home**: [github.com/xingzhen199186/dsh-everywhere](https://github.com/xingzhen199186/dsh-everywhere).
+- **Issues**: [GitHub Issues](https://github.com/xingzhen199186/dsh-everywhere/issues).
+
+---
+
+## License
+
+This project is released under the [MIT License](LICENSE).
+
+### Acknowledgements
+
+The multi-route QR-code approach was inspired by [dsh-pocket](https://www.npmjs.com/package/dsh-pocket) by @shaobeichen.

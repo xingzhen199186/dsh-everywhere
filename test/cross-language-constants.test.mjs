@@ -1,0 +1,185 @@
+import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+
+/**
+ * 电脑和手机靠字符串约定对话（动作名、通知类型）。
+ * 打错一个字母不会报错，只会静静地"永远不生效"——和 2026-11-12 那个
+ * 字符串 == 属于同一类静默失败，所以这里把两边的字面量摆在一起核对。
+ */
+
+const read = (p) => readFileSync(new URL(`../${p}`, import.meta.url), 'utf8')
+const host = read('lib/index.js')
+const poller = read('android/app/src/main/java/com/dsh/miniremote/BridgePoller.java')
+const bridge = read('lib/bridge.js')
+
+// 电脑侧写的是 name: 'phone_xxx'，手机侧写的是 "phone_xxx".equals(tool)。
+const hostNames = (text) => new Set([...text.matchAll(/name: '(phone_[a-z_]+)'/g)].map((m) => m[1]))
+const phoneNames = (text) => new Set([...text.matchAll(/"(phone_[a-z_]+)"/g)].map((m) => m[1]))
+
+test('电脑与手机认识同一批手机动作', () => {
+  // 只比**真的发给手机**的那些：read/write/edit/glob/grep 是在电脑这侧翻译成命令再发出的，
+  // 手机上并不需要认识它们。
+  const forwarded = new Set([
+    ...[...host.matchAll(/callPhone\('(phone_[a-z_]+)'/g)].map((m) => m[1]),
+    ...[...host.matchAll(/phoneBridge\.call\([^,]+,\s*'(phone_[a-z_]+)'/g)].map((m) => m[1]),
+    // 坐标动作走同一个转发函数 aimCall('phone_xxx', …)，名字同样是字面量。
+    ...[...host.matchAll(/aimCall\('(phone_[a-z_]+)'/g)].map((m) => m[1]),
+  ])
+  const onHost = forwarded
+  const onPhone = phoneNames(poller)
+  assert.ok(onHost.size >= 10, `电脑侧动作太少：${onHost.size}`)
+  assert.deepEqual(
+    [...onPhone].sort(),
+    [...onHost].sort(),
+    '两边的手机动作名必须完全一致，否则某个动作会静静地永远不生效',
+  )
+})
+
+test('电脑发出的任务结束通知，手机认的是同一个名字', () => {
+  assert.match(bridge, /kind: 'task-ended'/)
+  assert.match(poller, /"task-ended"\.equals\(notice\.optString\("kind"\)\)/)
+})
+
+test('每个手机工具都真的被注册（不是被挤成别人参数）', () => {
+  // 2026-11-12 真事故：插新工具时少了一个 `}))`，于是下一个工具对象变成了
+  // defineTool 的第二个参数——不报错、不崩，那个工具直接消失。
+  const firmly = [...host.matchAll(/name: '(phone_[a-z_]+)',/g)]
+  assert.ok(firmly.length >= 12, `工具数量异常：${firmly.length}`)
+  // 坏形状：`},` 后面紧跟 `{` 再紧跟 name，说明被并进了上一个 defineTool。
+  assert.doesNotMatch(host, /\},\n\s*\{\n\s*name: 'phone_/)
+  // 注册调用数必须不少于工具数，否则有工具没有自己的 register。
+  const registers = [...host.matchAll(/tools\.register\(defineTool\(\{/g)].length
+  assert.ok(registers >= firmly.length, `注册数 ${registers} 少于工具数 ${firmly.length}`)
+})
+
+test('有 Termux 才优先走终端，没有就回落点屏幕（两条都保留）', () => {
+  const bridge = read('lib/bridge.js')
+  const server = read('lib/server.js')
+  // 手机随心跳上报，电脑记下来。
+  assert.match(server, /termux: url\.searchParams\.get\('termux'\) === '1'/)
+  assert.match(bridge, /if \(typeof info\.termux === 'boolean'\) entry\.termux = info\.termux/)
+  // 指引必须分两种情形，且都保留无障碍那条路。
+  assert.match(host, /if \(!armed\.termux\)/)
+  assert.match(host, /do not call phone_shell/)
+  // 现在有三条路：本机文件（不依赖 Termux）、终端（有 Termux 时）、无障碍（界面）。
+  assert.match(host, /All routes stay available/)
+  // 不给终端单独编"永远确认"的规则：确认档位仍是那三档。
+  assert.doesNotMatch(host, /phone_shell[\s\S]{0,200}alwaysConfirm/)
+})
+
+test('全盘模式是默认关闭的实验开关，默认路径仍是系统选择器', () => {
+  // 2026-11-17 决定：允许声明 MANAGE_EXTERNAL_STORAGE，但只作为用户手动开启的
+  // 实验模式；默认路径必须还是 SAF（ACTION_OPEN_DOCUMENT_TREE）。
+  // Play 合规：该权限只对核心功能是文件管理/设备内搜索/备份的应用开放，
+  // 本应用是远程遥控，上架 Play 时很可能被要求移除——manifest 里必须留注释提醒。
+  const manifest = read('android/app/src/main/AndroidManifest.xml')
+  assert.match(manifest, /MANAGE_EXTERNAL_STORAGE/)
+  assert.match(manifest, /Play 合规/, 'manifest 要写明 Play 合规风险')
+  assert.match(manifest, /tools:ignore="ScopedStorage"/, '要显式标注 lint 豁免原因')
+
+  const activity = read('android/app/src/main/java/com/dsh/miniremote/MainActivity.java')
+  // 默认入口仍是系统选择器，全盘模式只是另开一个开关。
+  assert.match(activity, /Intent\.ACTION_OPEN_DOCUMENT_TREE/)
+  // 取持久授权，否则重启后又要用户重选。
+  assert.match(activity, /takePersistableUriPermission/)
+  // 开全盘模式只能跳系统设置，不能在 App 内伪造授权。
+  assert.match(activity, /ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION/)
+
+  const files = read('android/app/src/main/java/com/dsh/miniremote/NativeFiles.java')
+  assert.match(files, /app:/)
+  assert.match(files, /work:/)
+  // public: 必须先过 allFilesAllowed，不能只看路径前缀。
+  assert.match(files, /public:/)
+  assert.match(files, /allFilesAllowed\(context\)/)
+  assert.match(files, /Environment\.isExternalStorageManager\(\)/)
+  // 公共路径要锁在公共根目录内，防 ../ 越界。
+  assert.match(files, /路径越界/)
+})
+
+test('调试包也用正式密钥签，签名配置按 UTF-8 读', () => {
+  // 2026-11-17：不给调试包用正式密钥，App 内「检查更新」会一直报"有新版本"，
+  // 点了又装不上（构建产物是调试密钥签的，手机里那份是正式密钥）。
+  const gradle = read('android/app/build.gradle.kts')
+  assert.match(gradle, /signingConfigs/, '要有签名配置')
+  assert.match(gradle, /create\("devsig"\)/, '调试签名配置要独立命名')
+  assert.match(gradle, /debug \{[\s\S]*?signingConfig = signingConfigs\.getByName\("devsig"\)/,
+    'debug 构建要用正式密钥')
+  // 密钥与密码不能进仓库：只从环境变量或仓库外的 properties 读。
+  assert.match(gradle, /DSH_SIGNING_PROPS|signing\.properties/, '配置来自仓库外')
+  assert.doesNotMatch(gradle, /storePassword\s*=\s*"/, '不许把密码写进仓库')
+  // 必须按 UTF-8 读：密钥路径含中文目录，默认 ISO-8859-1 会读成乱码。
+  assert.match(gradle, /\.reader\(Charsets\.UTF_8\)/, 'properties 要按 UTF-8 读')
+  assert.doesNotMatch(gradle, /signingProps\.load\(found\.inputStream\(\)\)/, '不能用默认编码读')
+})
+
+test('终端只保留后台能力，界面上不出现', () => {
+  const activity = read('android/app/src/main/java/com/dsh/miniremote/MainActivity.java')
+  // 2026-11-12 用户决定：删掉全屏终端页，只留后台 phone_sh。
+  assert.doesNotMatch(activity, /TerminalActivity/)
+  assert.doesNotMatch(activity, /miniTerminalGo/)
+  // 后台能力本身必须还在。
+  const host = read('lib/index.js')
+  assert.match(host, /name: 'phone_sh'/)
+  const poller = read('android/app/src/main/java/com/dsh/miniremote/BridgePoller.java')
+  assert.match(poller, /"phone_sh"\.equals\(tool\)/)
+  const shell = read('android/app/src/main/java/com/dsh/miniremote/NativeShell.java')
+  assert.match(shell, /new ProcessBuilder\("\/system\/bin\/sh", "-c", command\)/)
+})
+
+test('这些面板跟设置页一样，由系统返回手势关掉', () => {
+  const activity = read('android/app/src/main/java/com/dsh/miniremote/MainActivity.java')
+  // 返回入口里必须登记页面里的各层，否则划返回/按返回关不掉它们（2026-11-12）。
+  const back = activity.slice(activity.indexOf('window.miniCloseTop=function()'), activity.indexOf('window.miniCloseTop=function()') + 2600)
+  assert.match(back, /subagentsBack/)
+  assert.match(back, /'subagents'/)
+  assert.match(back, /'ops'/)
+  assert.match(back, /'fileView'/)
+  // 不许再自己画动画：页面里那套跟手平移已经撤了。
+  const page = read('lib/page-app.js')
+  assert.doesNotMatch(page, /边缘滑动返回/)
+  // 系统手势要还回去：不许再把左边缘从系统手势区里挖掉。
+  assert.doesNotMatch(activity, /setSystemGestureExclusionRects/)
+  assert.doesNotMatch(activity, /excludeEdgeFromSystemGestures/)
+})
+
+test('「手机终端」「工作文件夹」与「屏幕操作」平级', () => {
+  const activity = read('android/app/src/main/java/com/dsh/miniremote/MainActivity.java')
+  // 三件事各管一摊，谁也不该藏在谁的展开体里（2026-11-12 用户要求）。
+  assert.match(activity, /termuxRow\.className='row'/)
+  assert.match(activity, /workRow\.className='row'/)
+  // 三块平级（2026-11-12 用户定的层次）：屏幕操作展开后才有「无障碍/确认档位/最近操作」。
+  assert.match(activity, /a11y\.insertAdjacentElement\('afterend',termuxRow\)/)
+  assert.match(activity, /termuxRow\.insertAdjacentElement\('afterend',workRow\)/)
+  assert.match(activity, />无障碍</)
+  assert.match(activity, />确认档位</)
+  // 「手机执行命令」紧跟「手机终端」：两行都在讲手机上怎么跑命令（2026-11-17 用户要求）。
+  assert.match(activity, /termuxRow\.insertAdjacentElement\('afterend',adbRow\)/,
+    '执行命令要排在手机终端下面')
+  assert.doesNotMatch(activity, /checkRow\.insertAdjacentElement\('afterend',adbRow\)/,
+    '不许再挂到自检那一行后面')
+  // 七行收进「手机操控」分组，默认收起（2026-11-17 用户要求）。
+  assert.match(activity, /miniPhoneCtlHead/, '要有「手机操控」折叠标题')
+  assert.match(activity, /id=\\"miniPhoneCtlBody\\" hidden/, '分组默认收起')
+  assert.match(activity, /conn\.insertAdjacentElement\('afterend',phoneCtl\)/, '分组插在「连接」下面')
+  assert.match(activity, /pbody\.appendChild\(block\)/, '手机桥要进分组')
+  assert.match(activity, />手机操控</, '标题文案要对')
+  // 展开状态存 sessionStorage：同一次会话记得住，App 重开就回到收起。
+  assert.match(activity, /sessionStorage\.setItem\('mini_phone_ctl_open'/, '要记住本次会话的展开状态')
+  assert.match(activity, /sessionStorage\.getItem\('mini_phone_ctl_open'\)/, '重载后要能读回来')
+  assert.doesNotMatch(activity, /localStorage\.setItem\('mini_phone_ctl_open'/, '不许用 localStorage 跨重启记住')
+  assert.match(activity, />最近操作</)
+  // 箭头固定格宽并居中，不跟着状态文字漂。
+  assert.match(activity, /#miniA11yChev\{flex:0 0 18px/)
+  // 标题字号要跟别的分类一致：不许在这里写死 font-size（2026-11-12 用户反馈过小一号）。
+  assert.doesNotMatch(activity, /#miniA11yHead\{[^}]*font-size/)
+})
+
+test('装好 Termux 之后就不再讲怎么装', () => {
+  const activity = read('android/app/src/main/java/com/dsh/miniremote/MainActivity.java')
+  // 说明要有 id，才能按状态显示/隐藏。
+  assert.match(activity, /id=\\"miniTermuxHow\\"/)
+  // 只在"没装"时显示：装了（不管有没有授权）都收起。
+  assert.match(activity, /how\.hidden=st\.installed===true/)
+})
+

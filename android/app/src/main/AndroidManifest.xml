@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        全盘模式（实验，默认关闭）：只有用户在系统设置里手动授予「所有文件访问」后，
+        App 才能用 public: 路径搜索公共目录。不要因为这里声明了就默认可用。
+
+        Play 合规提醒：Google Play 对 MANAGE_EXTERNAL_STORAGE 只允许核心功能确实是
+        文件管理/设备内文件搜索/备份等应用申请；本应用是远程遥控，若上架 Play，
+        这条声明很可能被要求移除或单独审核。GitHub 侧载版本可保留，但应在设置页
+        明确告知用户权限范围，且不要把它当默认路径（2026-11-17）。
+    -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <!--
+        Android 11 起默认看不见别的 App：不加这段「可查询」，连"打开微信"都会报
+        "这台手机上没有这个 App"——2026-11-10 真机实测过（无障碍能读屏，但打不开）。
+        这里只声明"带启动入口的 App"，不给更宽的查询面。
+    -->
+    <queries>
+        <!-- Android 11 起，看不到对方 App 就发不出 intent（Termux 的 RUN_COMMAND 需要它）。 -->
+        <package android:name="com.termux" />
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- App 内检查更新：下载完要能唤起系统安装器（2026-11-09）。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 扫配对二维码用；没有相机就不扫，手工粘贴仍然可用。 -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <!-- 任务期间保持一条推送连接：锁屏也能收到待审批（Android 14 起类型也要声明）。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- 锁屏期间保住 CPU 与 Wi-Fi，否则 socket 挂着但数据要等解锁才读（2026-11-06）。 -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 手机桥 `phone_status` 要报"连的是 Wi-Fi 还是流量"（2026-11-09）。
+         漏了这条，真机上整段状态会抛 SecurityException，连电量都一起读不到。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!--
+        全屏通知：闹钟/来电那种，能把熄着的屏幕点亮（2026-11-10）。
+        安卓 14 起默认只允许闹钟/通话类应用使用，其余要在系统设置里由用户手动允许。
+    -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+
+    <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+
+    <application
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:supportsRtl="true"
+        android:extractNativeLibs="true"
+        android:theme="@style/Theme.MiniRemote"
+        android:usesCleartextTraffic="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name_launcher"
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- 系统分享：文字和图片直接发进当前会话（2026-11-06）。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="image/*" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".PairActivity"
+            android:exported="false" />
+
+        <!-- 单条线路的配置页：从「连接」区块点进来，能改地址、扫码、重新配对。 -->
+
+        <activity
+            android:name=".LineConfigActivity"
+            android:exported="false"
+            android:screenOrientation="portrait" />
+
+        <!-- 应用内相机：荣耀封了第三方调用系统相机，只能自己拍（2026-11-06）。 -->
+        <activity
+            android:name=".CaptureActivity"
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|keyboardHidden" />
+
+        <!--
+            exported=false 不妨碍本应用的显式 PendingIntent 拉起它。
+            TODO(P1)：通知实现使用 new Intent(context, ApprovalReceiver.class) 显式指定接收器，
+            以 FLAG_IMMUTABLE 创建 PendingIntent；审批处理接 RFC 5.1 的
+            POST /mini/api/approval，请求头为 X-Mini-Device，请求体包含 approvalId。
+        -->
+        <receiver
+            android:name=".ApprovalReceiver"
+            android:exported="false" />
+
+        <!-- 从通知直接回答提问（2026-11-14）：和审批同一个套路，显式 Intent、不导出。 -->
+        <receiver
+            android:name=".QuestionReceiver"
+            android:exported="false" />
+
+        <!-- 只有这把前台服务在跑的时候才保持长连接；回前台立刻停，不双开。 -->
+        <service
+            android:name=".MiniForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 只用来接收 Termux 回传的命令结果，别的 App 不能碰（exported=false）。 -->
+        <service
+            android:name=".TermuxResultService"
+            android:exported="false" />
+
+        <!-- 拍照那条：相机把照片写进缓存目录，再把 content:// 交回网页（2026-11-06）。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <!-- 剪贴板确认按钮的落点：只有用户点了才写（2026-11-09）。 -->
+        <receiver
+            android:name=".ClipboardReceiver"
+            android:exported="false" />
+
+        <!--
+            确认卡改成通知之后的按钮落点（2026-11-11）。
+            exported=false：只有本应用自己构造的 PendingIntent 能拉起它，外部 App 发不进来。
+        -->
+        <receiver
+            android:name=".ConfirmActionReceiver"
+            android:exported="false" />
+
+        <!-- 无障碍服务只存在于 src/bridge，standard 不合并该声明。 -->
+            <!-- 配对码从通知的输入框里来（2026-11-15）：只给本 App 用，不导出。 -->
+        <!-- 导出给 adb 身份调用，只为让开发时能把整条流程跑通；
+             android.permission.DUMP 只有 shell/调试身份持有，普通 App 调不动。 -->
+        <receiver
+            android:name=".AdbPairingReceiver"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
+    </application>
+</manifest>

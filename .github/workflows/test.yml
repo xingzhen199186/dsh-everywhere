@@ -1,0 +1,92 @@
+# 回归闸门。
+#
+# ## 为什么只有这两层
+#
+# 工程说明把验证分成四层，这里只跑第①层（离线测试 + 客户端校验）。另外两层不能进 CI：
+#   ② 加载探针   —— 要真的 cordis 与 DSH 宿主
+#   ③ 活体检查   —— 要**正在运行**的 DSH 打真接口
+#   ④ 真机       —— 要一台手机
+# 把跑不了的东西塞进 CI，只会让它长期红着、然后没人看。它们仍然是"改完手跑"的。
+#
+# ## 两个 job 的职责不一样，别合并
+#
+#   gate  —— 和开发机同平台（Windows），**红了就是真红**，必须修。
+#   probe —— Linux 上跑一遍，**允许红**，但必须看得见。它红了一般是"某条断言只在
+#            Windows 上成立"（测试里有 `process.platform` 分支、也有 `I:\...` 这种
+#            假路径），那属于测试的平台假设，修测试，不放宽断言。
+#
+# ## probe 红过什么（2026-10-17 首跑登记；当天就修好了，留着当参考）
+#
+# 首跑它红了 5 条，全是**测试假设了 Windows**：
+#   · `join('I:', …)` 在 Windows 上 `I:` 是盘符，在 Linux 上只是个普通目录名，
+#     `resolve` 会先拼上当前工作目录（browse 的路径规范化、面包屑）；
+#   · 工作区标题退到目录名那几条靠 `basename` 处理 `'I:\\a'`，Linux 上 `\` 不是分隔符，
+#     整串原样返回。
+#
+# **产品代码没有错**，错的是测试。改法是给这些测试一个 `PLATFORM_ROOT = parse(process.cwd()).root`
+# —— 不是加平台 skip：skip 会让 probe 变成永远绿、失去探测价值。现在这些语义在两边都验，
+# 以后谁再在测试里写死 Windows 路径，probe 照样会红，那正是它该抓的。
+#
+# 判断标准：**probe 红，先看是不是这类"路径/时区/换行符"的平台假设；出现别的才是真信号。**
+#
+# ## 超时
+#
+# 15 分钟是防"挂死"的：这个仓库真出过一次测试进程卡住不退出（一个断言在踩到
+# 句柄泄漏的路径上抛了，进程吊在那儿），当时在本地白等了半小时。CI 上更要有上限。
+#
+# ## 本地怎么预演 CI 的时间条件
+#
+# GitHub 的 runner 跑在 UTC 上。本机是 UTC+8，所以"时间显示"那类断言在本机永远是绿的
+# ——2026-10-17 首跑就是这么红了三条（把 `+08:00` 的绝对时刻拿去和本地格式化结果比）。
+#
+# 预演办法：`TZ=UTC node client/verify.mjs`（PowerShell 里先 `$env:TZ="UTC"`）。
+# Node 认这个环境变量，构造与读取会一起换到 UTC，和 runner 上一致。
+# **动到任何与时间显示有关的断言时，先这样跑一遍。**
+
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  gate:
+    name: gate (windows / node ${{ matrix.node }})
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # 与 package.json 的 engines 对齐：^22.19.0 || >=24.0.0
+        node: ['22', '24']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 版本一致性校验要读 CHANGELOG 与 package.json 的完整历史？不需要，只要工作区。
+          fetch-depth: 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: 装依赖（按 lock 文件，不接受漂移）
+        run: npm ci
+      - name: 离线测试
+        run: npm test
+      - name: 客户端那半边的自验（零依赖、不需要 DSH 在跑）
+        run: node client/verify.mjs
+
+  probe:
+    name: probe (linux / node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # 允许红：这里是"跨平台探测"，不是回归闸门。红了要报告，但不阻塞合并。
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: node client/verify.mjs

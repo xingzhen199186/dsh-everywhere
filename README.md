@@ -1,0 +1,328 @@
+<div align="center">
+
+# DSH Everywhere · dsh-everywhere
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/promo.webp" alt="极简遥控器：在手机上按需查看指令、结论与执行过程" width="720" />
+</p>
+
+**随时随地用 DeepSeek Harness 改变世界。**
+
+[![GitHub Release](https://img.shields.io/github/v/release/xingzhen199186/dsh-everywhere)](https://github.com/xingzhen199186/dsh-everywhere/releases/latest)
+[![Node.js](https://img.shields.io/badge/node-%5E22.19.0%20%7C%7C%20%3E%3D24.0.0-brightgreen)](https://nodejs.org/)
+[![DSH](https://img.shields.io/badge/DSH-%3E%3D0.1.5--rc.2%20%3C0.3.0-blue)](https://github.com/deepseek-ai/DeepSeek-Harness)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+[English](README.en.md) · [简体中文](README.md)
+
+</div>
+
+<p align="center">
+  <a href="#快速开始">快速开始</a> ·
+  <a href="#dsh-everywhere-手机-app">手机 App</a> ·
+  <a href="#ai-配置向导">AI 配置</a> ·
+  <a href="#连接方式">连接方式</a> ·
+  <a href="#核心能力">核心能力</a> ·
+  <a href="#设置页">设置页</a> ·
+  <a href="#排障">排障</a> ·
+  <a href="#安全边界">安全边界</a> ·
+  <a href="#文档">文档</a>
+</p>
+
+---
+
+## 这是什么
+
+DSH Everywhere 是一个运行在 [DeepSeek Harness（DSH）](https://github.com/deepseek-ai/DeepSeek-Harness) 里的插件。手机 App 与电脑插件现在使用同一个名字，主要解决三件事：
+
+- **手机遥控**：在手机浏览器里切换「单帧」、「聊天」和「完整」模式查看会话、发送指令、回答问题或处理审批，不必把整个桌面界面挤进小屏。
+- **远程窗口**：在另一台电脑的 DSH 桌面端直接打开这台电脑的完整界面。
+- **A/B 跨机协作**：用A端电脑上的DSH在B端电脑上工作。A 端保留会话和模型，通过 `b_*` 工具读写 B 端文件、执行命令；B 端本地决定授权范围。
+
+连接方式可以从内网、Tailscale 一路扩展到固定地址和自建中继。不熟悉网络配置时，可以让插件内置的 AI 向导带着走。
+
+---
+
+## 快速开始
+
+### 环境
+
+- **Node.js**：`^22.19.0 || >=24.0.0`
+- **DSH**：`>=0.1.5-rc.2 <0.3.0`
+- **系统**：Windows、macOS 或 Linux
+
+当前版本在 DSH `0.2.2-rc.3` 上完成兼容复核。各版本改了什么，见 [CHANGELOG.md](CHANGELOG.md)。
+
+### 安装
+
+支持 **GitHub 仓库、Release 里的 tgz、本地目录**三种来源。`web` 是 DSH 默认 Profile 名称；使用自定义配置档时替换为对应名称。
+
+#### 途径一：GitHub 仓库（推荐）
+
+在 DSH「插件 → 添加插件」中输入 `github:xingzhen199186/dsh-everywhere`，或在终端执行：
+
+```powershell
+dsh plugin --profile web add github:xingzhen199186/dsh-everywhere
+```
+
+#### 途径二：Release 里的 tgz
+
+从 [GitHub Releases](https://github.com/xingzhen199186/dsh-everywhere/releases/latest) 下载 `dsh-everywhere-0.3.1.tgz`，在「添加插件」中选择这个文件，或执行：
+
+```powershell
+dsh plugin --profile web add C:\path\to\dsh-everywhere-0.3.1.tgz
+```
+
+#### 途径三：本地目录
+
+适合开发者调试。在「添加插件」中输入目录的绝对路径，或执行：
+
+```powershell
+dsh plugin --profile web add C:\path\to\dsh-everywhere
+```
+
+> **确认来源可信**：插件在本机以当前用户的完整权限运行。来源不明的插件可能损坏 DSH，或读取和泄露敏感数据。升级前先在插件页卸载旧版本；暂不支持自动更新。
+
+### 从旧插件 dsh-mini-remote 迁移
+
+1. 按上面任一方式安装 `dsh-everywhere`。
+2. 在 DSH 插件页卸载旧的 `dsh-mini-remote`，再按 DSH 提示重新启动或重新加载。**不要让新旧插件同时启用**，否则端口和路由可能冲突。
+3. 在「设置 → 遥控设置」重新配对手机和其他电脑，并检查隧道、飞书、自建中继等配置。
+
+插件数据目录已从 `$DSH_HOME/dsh-mini-remote` 改为 `$DSH_HOME/dsh-everywhere`，**旧配置不会自动继承**，需要重新配对和核对设置。Android App 可以继续使用，但其应用标识和签名不变。
+
+### 包内内容与按需下载
+
+- **npm tgz 约 2.5 MB，不含任何可执行文件**。`frpc.exe` 和 `relay-server` 不随包发布，改由本仓库和 Releases 提供。
+- **首次使用 Cloudflare 隧道**：自动下载 cloudflared（约 50 MB），来源是 Cloudflare 官方 GitHub 发布页，含镜像兜底。
+- **首次开启自建中继**：自动下载 frpc（约 16 MB），来源是本项目 Releases，下载后按源码中钉死的 SHA-256 校验，不匹配就删除。
+- 插件具备远程命令、文件读写、屏幕操作和隧道等**双用途能力**。合法用途、默认开关和授权边界在 [package.json](package.json) 的 `contentPolicy` 与 [DISCLOSURE](DISCLOSURE) 中公开声明。
+
+### 启动与服务确认
+
+1. 重启 DSH 服务（关闭当前 `dsh web` 窗口并重新运行）。
+2. 查看控制台启动日志。插件会输出初始化信息与本机监听端口：
+
+   ```text
+   [dsh-everywhere] 已启动：http://127.0.0.1:3090/mini
+   ```
+
+3. 打开 DSH 桌面端界面，进入「设置」→ 左侧导航选择「遥控设置」，查看配对二维码与连接详情。
+
+> **手机端有两种形态：浏览器网页，或 Android 应用 DSH Everywhere。** 网页扫码即可用，所有手机都能开；Android 应用额外提供锁屏通知、快捷审批、系统分享和内置 Tailscale，详见 [DSH Everywhere 手机应用](docs/DSH-Everywhere.md)。页面也可以「添加到主屏幕」，图标打开时为全屏显示，实际仍由浏览器运行。更换手机或清除浏览器数据后，需要重新扫码配对。
+>
+> 同一地址也能在 PC 浏览器中打开；开启「进阶设置」后，还可在其中使用完整的 DSH 电脑端界面。
+>
+> **怎样确认启动成功**：设置页出现「遥控设置」标题、连接地址与二维码；控制台出现 `[dsh-everywhere] 已启动` 行。若只有控制台输出而设置页为空，先刷新或重启 DSH，再检查「诊断与高级」里的自检。
+
+### 连接手机
+
+1. 打开 DSH「设置」→「遥控设置」。顶部的「手机连接」始终显示。
+2. 手机与电脑在同一 Wi-Fi 时，直接扫描「内网」二维码。
+3. 不确定该选哪条路时，点击顶部的「让 AI 带我配置」，按提示操作。
+4. 手机页面能打开会话列表，且「电脑与设备」里出现这台手机，即连接成功。
+
+> **配对链接等同于入场凭据。** 二维码和复制出的链接里是一次性配对 grant，默认 5 分钟内有效；配对成功后长期凭据保存在 HttpOnly Cookie 中，不出现在网址里。未使用的链接仍可登记设备，不要截图外发、投屏或粘贴到公开位置。撤销设备后，需要重新扫码。
+
+---
+
+## 效果预览
+
+### 对话界面（单帧 / 聊天 / 完整）
+
+移动端页面使用原生 JavaScript 开发，无前端构建负担，支持深海墨蓝（深色）与冰蓝宝蓝（浅色）两套高对比度主题。同一场对话有三种看法：单帧整屏只留最新一条结论，聊天把历史一条条排成气泡，完整再把每一轮的执行轨迹插回对话原位：
+
+<div align="center">
+  <img width="290" alt="聊天（深色）：一来一回排成气泡，一屏看得到多条历史" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/screen-chat-dark.png" />
+  <img width="290" alt="聊天（浅色）：同一段对话的浅色版" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/screen-chat-light.png" />
+</div>
+
+### 设置面板与外观切换
+
+通过右上角设置随时切换呈现模式、外观主题与网络重连控制：
+
+<div align="center">
+  <img width="290" alt="设置（深色）：显示模式三选一、外观选中深色" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/settings-dark.png" />
+  <img width="290" alt="设置（浅色）：选中态和主按钮都跟着换成宝蓝" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/settings-light.png" />
+</div>
+
+### 执行动画状态
+
+任务运行中动态展示拟人化跑动状态、耗时计时器与排队刻度尺，消除不可知等待：
+
+<div align="center">
+  <img width="290" alt="执行中（深色）：鲸鱼娘正在跑、已计时 14 秒、队列刻度上排着一条" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/running-dark-phone.jpg" />
+  <img width="290" alt="执行中（浅色）：同一次执行，鲸鱼娘正在跑、已计时 14 秒、排队中 1 条" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/running-light-phone.jpg" />
+</div>
+
+### 远程窗口
+
+在另一台电脑的 DSH 桌面端直接打开这台电脑的完整界面：
+
+<div align="center">
+  <img width="680" alt="远程窗口：在另一台电脑的 DSH 面板中嵌入完整界面" src="https://raw.githubusercontent.com/xingzhen199186/dsh-everywhere/main/docs/remote-window.png" />
+</div>
+
+---
+
+## DSH Everywhere 手机 App
+
+如果你不想每次都开浏览器，或者需要**锁屏也能收到审批、把别的 App 里的内容直接分享给 DSH、让电脑直接操作手机屏幕**，可以安装配套的 Android 应用 **DSH Everywhere**。
+
+手机 App 与插件现在统一叫 **DSH Everywhere**，不是两套产品：连接、会话和权限与网页版共用同一套，模型与文件仍然留在电脑。**应用标识沿用 `com.dsh.miniremote`，这是历史原因**；签名别名与 APK 文件名规则也不变，保证老用户可以覆盖升级。
+
+> **使用 App 前，请先在电脑上安装并启动 `dsh-everywhere` 插件 0.3.0 或以上版本。** 更早的插件没有 App 需要的配对、地址池和更新接口。
+
+| 安装包 | 说明 |
+| :--- | :--- |
+| `DSH-Everywhere-0.1.0.apk` | 配对、会话、通知、快捷审批、系统分享、内置 Tailscale，以及可选的屏幕操作。无障碍权限只在你主动开启「屏幕操作」时才需要 |
+
+- **下载**：[GitHub Releases 最新版](https://github.com/xingzhen199186/dsh-everywhere/releases/latest)
+- **要求**：Android 9 及以上、arm64 手机；电脑端已安装并运行本插件
+- **DSH 的运行环境始终在电脑上，不在手机上。** 手机浏览器和 DSH Everywhere 只是遥控入口：模型、会话引擎和会话文件都在电脑，手机端不能单独运行 DSH；电脑关机或断网时，手机端无法继续使用。
+- **完整说明**：[DSH Everywhere 手机应用](docs/DSH-Everywhere.md)
+
+如果想在手机上用 Python、Node、git、ssh、ffmpeg 这类完整工具，可以另装官方 Termux 配合 App；Termux 不是前置必需，不装也能用 App。无论装不装 Termux，App 都要求电脑端插件 0.3.0+。详见 [Termux 板块](docs/DSH-Everywhere.md#termux)。
+
+App 执行手机命令有两条路：**无线调试**（轻量，推荐）和 **Termux**（可选，完整 Linux 环境）。两条都可用时，优先走无线调试自连通道，Termux 作为兜底和完整环境。详见 [手机命令：无线调试与 Termux](docs/DSH-Everywhere.md#手机命令无线调试与-termux)。
+
+**不用 App 也可以直接用手机浏览器。** 在电脑端打开「设置 → 遥控设置」，让手机扫描页面上的二维码（或手动打开配对链接）即可；iOS、平板和临时借用别人的手机都走这条网页路。详细步骤见 [10-手机连接与密码](docs/guide/10-手机连接与密码.md)。
+
+---
+
+## AI 配置向导
+
+插件包内已经带有 `dsh-everywhere-setup` 技能和 [docs/guide/](docs/guide/) 知识库，**不需要单独安装技能**。
+
+1. 在「遥控设置」顶部点击「让 AI 带我配置」。插件会打开新会话，并把配置提示词填进输入框；按发送后向导才开始工作。
+2. 也可以直接在会话里说「帮我配置手机遥控」，或描述「手机连不上」「要固定地址」等具体问题。
+3. 向导会先调用只读工具 `mini_remote_status`，查看端口、地址、隧道与中继状态，再判断场景并**一次只问一个问题**。
+4. 每一步都会说明要点的位置和做完后应看到的结果。当前环境不能自动打开新会话时，按钮会复制提示词，粘贴到新会话即可。
+
+覆盖范围包括：手机连接与密码、所有连接方式、电脑与设备、A/B 端协作、B 项目、飞书、自检与进阶设置、远程窗口，以及参数生效方式。
+
+向导优先读取随插件版本发布的 `docs/guide/`，只有本地文档不可用时才以 GitHub 仓库兜底。
+
+**安全边界**：不读取或复述密码、token、frp token 和设备凭据；不自动重启 DSH；不删除设备、不撤销租户、不删除服务器资源；不修改 Cloudflare、防火墙、DNS 或域名解析。高风险操作只提供步骤，由用户自己确认。
+
+---
+
+## 连接方式
+
+先选一条能走通的，再考虑固定地址。手机和电脑在同一 Wi-Fi 时用内网；其余场景按是否需要安装客户端、是否需要固定网址来选择。
+
+| 方式 | 适合 | 前提与代价 | 详情 |
+| :--- | :--- | :--- | :--- |
+| **内网** | 同一 Wi-Fi | 无额外依赖；明文 HTTP，离开局域网即失效 | [01-内网](docs/guide/01-内网.md) |
+| **Tailscale** | 出门也要用，能装客户端 | 两端登录同一账号；可选 HTTPS，加密地址依赖 MagicDNS | [02-Tailscale](docs/guide/02-Tailscale.md) |
+| **Cloudflare 公网** | 临时使用，或用自己的域名做固定地址 | 临时地址每次重启变化；固定地址需要 Cloudflare 账号和域名；流量经 Cloudflare | [03-公网隧道](docs/guide/03-公网隧道.md) |
+| **手动公网地址** | 已在插件外配好 Tailscale Funnel、反向代理或其他公网入口 | 插件只展示地址和二维码，不建立、不探测、不修复链路；入口本身要能打开 `/mini`；Tailscale Funnel 只支持 443、8443、10000 三个公网端口 | [04-手动公网地址](docs/guide/04-手动公网地址.md) |
+| **共享固定地址** | 要固定网址，但不想维护服务器 | 需要快速隧道和服务方邀请码（默认 30 分钟内有效，见详情）；流量经共享中继，不是端到端加密 | [05-共享固定地址](docs/guide/05-共享固定地址.md) |
+| **专属固定地址** | 服务方分配固定域名或开放自服务 | 一次性激活码（默认 30 分钟内有效，见详情）；服务方代建命名隧道，停止不会自动删除服务端资源 | [06-专属固定地址](docs/guide/06-专属固定地址.md) |
+| **自建中继（单用户）** | 有自己的服务器和域名 | 需要一台自己的公网服务器和一个自有域名；准备两个域名和 frp token；地址固定，服务器和证书自行维护 | [07-自建中继](docs/guide/07-自建中继.md) |
+| **自建多用户中继** | 多人各自使用，有自己的服务器和域名 | 需要一台自己的公网服务器和一个自有域名；管理员部署 `relay-multi` 并发邀请票；流量只经过管理员服务器 | [08-自建多用户中继](docs/guide/08-自建多用户中继.md) |
+| **飞书** | 只通过企业 IM 使用 | 配置飞书自建应用；不需要公网入站，当前只处理单聊和审批 | [14-飞书通知](docs/guide/14-飞书通知.md) |
+
+共享固定地址和专属固定地址的邀请码由服务方发放。没有邀请码时，通过服务方提供的申请入口获取；插件不提供公开注册入口。
+
+
+---
+
+## 核心能力
+
+- **手机页面**：单帧、聊天、完整三种视图；支持队列、斜杠指令、选择题、审批和会话管理。详见 [10-手机连接与密码](docs/guide/10-手机连接与密码.md)。
+- **DSH Everywhere 手机 App**：同一套页面的 Android 原生入口，补上锁屏通知、快捷审批、系统分享、内置 Tailscale，以及通过无线调试执行手机命令（需要完整 Linux 环境时可另装 Termux）；详见 [DSH Everywhere 手机应用](docs/DSH-Everywhere.md)。
+- **远程窗口**：在另一台电脑的 DSH 桌面端打开本机完整界面。详见 [16-远程窗口](docs/guide/16-远程窗口.md)。
+- **A/B 端协作**：A 端使用 `b_*` 操作 B；B 端本地控制目录、写入、文件夹管理和命令权限。重新配对会按 `machine-id` 复用原记录。详见 [12-A/B 端协作](docs/guide/12-A-B端协作.md)。
+- **B 项目**：把 B 端真实目录登记为 A 端工作区，不复制文件；提供 B 文件面板和「新建 B 会话」。详见 [13-B 项目](docs/guide/13-B项目.md)。
+- **飞书双向遥控**：通过长连接收发文本、回答选择题和审批。详见 [14-飞书通知](docs/guide/14-飞书通知.md)。
+- **设备管理**：手机和电脑分别登记，可改名、撤销；名册最多 5 台，30 天没有活动会自动删除，撤销后必须重新扫码。详见 [11-电脑与设备](docs/guide/11-电脑与设备.md)。
+
+---
+
+## 设置页
+
+顶部「手机连接」始终显示；下方五个分组默认收起，组内小分类（例如「连接与固定地址」里的各个入口）也默认收起。
+
+| 区域 | 主要内容 |
+| :--- | :--- |
+| **手机连接** | 地址、二维码、密码 |
+| **连接与固定地址** | Tailscale、公网访问、共享固定、专属固定、自建中继、自建多用户中继、Tailscale HTTPS |
+| **电脑与设备** | 允许别的电脑连接、设备名单、其他电脑 |
+| **A/B 端协作** | 作为 A 端、作为 B 端、B 项目 |
+| **通知与集成** | 飞书、凭据、白名单、配置指引 |
+| **诊断与高级** | 自检、最近错误 |
+
+设置项的完整说明见 [15-自检与进阶设置](docs/guide/15-自检与进阶设置.md) 与 [17-参数与生效方式](docs/guide/17-参数与生效方式.md)。
+
+---
+
+## 排障
+
+| 现象 | 先检查 |
+| :--- | :--- |
+| B 端显示「还没连上 A」 | 等待一个 5 秒刷新周期，再按 `Ctrl+F5`；仍不成功时检查 A 的地址、开关和端口 |
+| 远程窗口返回 HTTP 502 | 在 A 端执行 `tailscale serve status`，代理应指向当前手机服务端口；默认是 `3090`，不是旧 `3091` |
+| 固定地址或中继连不上 | 查看状态、邀请票/激活码是否已用过，以及服务端资源是否仍在 |
+| 手机页面被撤销后进不去 | 设备授权已被移除，需要回到「遥控设置」重新扫码 |
+
+`tailscale serve status` 的代理目标应类似：
+
+```text
+https://<机器名>.<tailnet>.ts.net
+  -> http://127.0.0.1:3090
+```
+
+如果 `3090` 被占用，以「诊断与高级」→「自检」显示的「在听端口」为准。修改后，在 A 端「连接与固定地址」将「Tailscale HTTPS」关闭再开启即可重新配置。
+
+更完整的症状表和检查步骤见 [09-连不上怎么办](docs/guide/09-连不上怎么办.md)。
+
+---
+
+## 安全边界
+
+- **地址与设备**：二维码和复制链接含一次性配对 grant，默认 5 分钟内有效；长期凭据在 HttpOnly Cookie 中，不进入网址。撤销设备后必须重新扫码，不要公开二维码、密码或未使用的配对链接。
+- **公网与第三方**：Cloudflare、共享固定中继和 B 专属固定都会让流量经过第三方；临时域名变化不是安全边界。自建和多用户中继也会让服务器运营者看到明文。
+- **插件权限**：插件以当前用户权限运行，只应安装可信来源的包；来源不明的插件可能读取文件或泄露凭据。
+- **完整界面**：「进阶设置」和远程窗口会暴露完整 DSH 管理面，包括模型配置、凭据、插件和会话记录，只应对可信设备开放。
+- **命令执行**：手机「完全权限」和 B 端命令权限都能执行系统命令；模型层 `confirm` 不是人工审批，真正的边界是本地权限开关。
+- **资源回收**：停止连接或清空本地配置不等于删除服务器资源；固定地址、租户和隧道需要按对应文档单独回收。
+- **公网承诺**：本插件不承诺公网部署安全。启用公网或第三方中继前，应自行评估网络环境、访问控制和主机安全。
+
+---
+
+## 开发与验证
+
+```bash
+npm test
+node client/verify.mjs
+```
+
+- `npm test`：离线测试，不要求 DSH 正在运行。
+- `node client/verify.mjs`：验证客户端模块、设置页、两级折叠、远程窗口和 B 项目面板。
+- 以命令实际输出为准。
+- 发布前可运行 `npm pack --dry-run` 检查打包内容。
+
+详细变更见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## 文档
+
+- **完整指南**：[docs/guide/](docs/guide/)（00–17）。连接、密码、设备、A/B、B 项目、飞书、自检、远程窗口和参数都在这里。
+- **手机 App**：[DSH Everywhere 手机应用](docs/DSH-Everywhere.md)。下载、安装、版本选择、权限与排障。
+- **AI 向导**：[SKILL.md](SKILL.md)。
+- **自建中继服务器**：[relay-server/README.md](relay-server/README.md)。
+- **多用户中继服务器**：[relay-multi/README.md](relay-multi/README.md)。
+- **项目主页**：[github.com/xingzhen199186/dsh-everywhere](https://github.com/xingzhen199186/dsh-everywhere)。
+- **问题反馈**：[Issues](https://github.com/xingzhen199186/dsh-everywhere/issues)。
+
+---
+
+## 开源协议
+
+本项目采用 [MIT 许可证](LICENSE) 开源。
+
+### 致谢
+
+本项目在通道交互和配对界面设计上参考了 [dsh-pocket](https://www.npmjs.com/package/dsh-pocket)（作者 @shaobeichen）的多路径独立二维码构思。

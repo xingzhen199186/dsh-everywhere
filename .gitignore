@@ -1,0 +1,140 @@
+# 依赖
+node_modules/
+
+# 52MB 的 cloudflared 二进制。
+#
+# 为什么不提交：代码**不读仓库里的这份**。cloudflared 的查找顺序是
+#   配置里指定的 → 系统 PATH → dsh-pocket 下过的那份 → 自己下载到数据目录
+# 仓库里的 bin/ 不在其中；package.json 的 files 也只打包 lib/client/cordis.patch.yml/README.md。
+# 提交它等于凭空给仓库加 52MB，而且 GitHub 对超过 50MB 的单文件会告警。
+# 首次开公网访问时插件会自己下载（带国内加速源），README 里也是这么跟用户说的。
+bin/
+
+# 立绘生成过程的原图，49 个文件约 50MB。
+# 成品是 lib/art/*.webp（已提交）。这些是中间产物，不进仓库。
+# ⚠️ 但它们是**不可再生的**：绘图模型每次出的图都不一样，删了就得重画。
+#    所以不进 git 不等于可以删，建议另找地方备份一份。
+dsh-image-gen/
+
+# 内部文档，不进仓库（2026-09-22 用户裁决）
+#
+# 对外发布的只有 README.md。这三样是给我们自己看的：工程说明是设计与取舍的
+# 完整记录，使用指南的内容已并入 README，tasks/ 是开发过程的工作记忆。
+#
+# ⚠️ 代价要说清楚：它们因此**没有版本保护**了。2026-09-22 就出过一次事——
+#    tasks/lessons.md 被误覆盖，1363 行变 79 行，因为没有 git，无处找回。
+#    要同时做到「不公开」和「有版本保护」，办法是另建一个**私有**仓库装它们
+#    （或者用 git 的 --git-dir 指到仓库外面）。目前没做，属于已知的取舍。
+使用指南.md
+工程说明.md
+tasks/
+# 交接报告（写给下一位接手的人，同样是内部文档）。
+# 2026-09-25 那次 OOM 事故的记录就落在这类文件里——它是本地文件，不进仓库，
+# 免得哪天 `git add -A` 把它带上 GitHub。
+交接报告-*.md
+# 两端验收报告（同属内部文档，理由同上）。2026-10-05 补：这份报告里有本机端口、
+# 进程 PID、两端 profile 的依赖清单，同样是「只给我们自己看」的东西。
+两端验收报告-*.md
+
+# 排障与验证用的临时脚本/日志（2026-10-05 补）。
+# 交接报告 5.3 节一直写着「scratch/ 不入库」，但 .gitignore 里其实**从来没有这一条**
+# ——它只是「碰巧没人跑过 git add -A」。这层里全是本机路径、会话 id、进程日志，
+# 还有从 app.asar 解出来的外壳源码，一样都不能上 GitHub。
+scratch/
+
+# 要送到手机上的图（回复里写 ![说明](out-名字) 引用，见 page.html 的 mdInline）。
+# 这些是运行时的临时产物：要给你看什么就现放一张，看完可以删。
+# 不进仓库的理由和上面一样——它们不是产品的一部分，只是「这一次要给你看的东西」。
+lib/art/out-*.webp
+# 同上，动图那种（2026-09-29 补）。
+# ⚠️ 例外：lib/art/out-anim-*.gif 那四张**已经在仓库里**了，忽略规则管不到已跟踪的文件，
+#    它们照旧会被 `git add` 带上（改了就提交，别以为是漏了）。
+lib/art/out-*.gif
+
+# 编辑器与系统垃圾
+.DS_Store
+Thumbs.db
+*.log
+.tmp/
+
+# 交付给用户看的成图（仓库里公开用的图在 docs/）
+screenshots/
+
+# 内部资料与会话转储，不进仓库（和上面「内部文档」同一条裁决）
+#
+# 这六类文件目前本机没有、也从未提交过，所以今天没有泄露；但这是**公开仓库**，
+# 一旦哪次误 `git add -A`，本机路径和会话内容就会上 GitHub。
+#   AGENTS.md、subagents/       —— 代理指令与子代理资料，属内部工作文件
+#   DELIVERY-EVIDENCE.md        —— 交付证据
+#   session.v4.jsonl            —— DSH 会话转储
+#   dsh-session-*.zip           —— 会话导出包
+#   *.tgz.bak-*                 —— 打包备份
+AGENTS.md
+subagents/
+DELIVERY-EVIDENCE.md
+session.v4.jsonl
+dsh-session-*.zip
+*.tgz.bak-*
+
+# 自建中继内置的 frpc（前面 `bin/` 是给别的目录用的，这里单独放行）
+!lib/bin/
+!lib/bin/frpc.exe
+!lib/bin/README.md
+!lib/bin/frp-LICENSE
+
+# 运维凭据（只读令牌、管理令牌、Access 服务令牌）已统一移出仓库：
+# I:\极简遥控器\运维\凭据。旧路径仍保留忽略，防止旧脚本误生成后被提交。
+worker/.staging-secrets.json
+
+# 内部设计与运维文档：只留在本机，不发布到公开仓库。
+# 这些不是用户使用指南；包含实施过程、容量估算、运维记录、验收记录和内部方案。
+docs/A-*.md
+docs/B-*.md
+docs/C-*.md
+docs/中继方案-C-A.md
+docs/固定地址运维手册.md
+docs/b-agent-acceptance.md
+docs/自建多用户中继-安装包设计.md
+docs/国内中继方案框架.md
+docs/验收记录-*.md
+docs/character.md
+docs/发版清单.md
+docs/art-refs/
+
+# 未使用或已过时的配图：保留本机文件，不再作为公开文档资源。
+docs/approval-card-*.png
+docs/promo.png
+docs/promo-legacy.*
+docs/screen-dark.png
+docs/screen-light.png
+docs/screen-full-light.png
+
+# 自有服务端控制面、运维台和防滥用实现：只留本机，不发布到公开仓库。
+# 包含后台地址、管理 API、Cloudflare/D1 资源、Secrets 配置和限额实现。
+worker/
+worker-b/
+test/worker.test.mjs
+
+# 私人运维脚本：不进入公开 GitHub 仓库；同步到知识库 X 的运维目录。
+scripts/ops-*.mjs
+
+# 新会话交接文件，只放本机，不进公开仓库。
+HANDOFF.md
+
+# 内置 Tailscale 的两个产物：AAR（Go 内核）与守护进程二进制，合起来近 40MB。
+# 它们由脚本生成，不进版本库；apk 分发时已经打在里面。
+# 生成方式见 android/README.md「内置 Tailscale」一节。
+android/app/libs/appctr.aar
+android/app/src/main/jniLibs/arm64-v8a/libtailscale.so
+android/app/.cxx/
+
+# 发布签名密钥一律不进版本库（2026-11-16）
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.bks
+keys/
+
+# 打包产物：npm pack 生成的安装包不入仓
+*.tgz

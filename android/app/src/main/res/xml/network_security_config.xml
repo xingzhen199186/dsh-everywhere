@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!--
+        允许明文 HTTP，但只与「配对地址池里的主机」通信（2026-11-05 决定）。
+        原因：内网与 Tailscale 默认就是 http，这是本产品最常见的一条路；而这份系统
+        XML 不支持 CIDR，没法只放行 10/172.16-31/192.168 三段。
+        安全边界改由代码守：
+          · Net 只请求配对链接给出的 baseUrl 和地址池里的地址；
+          · WebView 只导航到 MainActivity.isPairedOrigin() 认可的源；
+          · 配对成功后的设备凭据只随 X-Mini-Device / HttpOnly Cookie 走。
+        要收紧时换成 https 地址即可，这里不用改。
+    -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

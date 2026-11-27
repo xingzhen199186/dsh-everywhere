@@ -1,0 +1,100 @@
+{
+  "name": "dsh-everywhere",
+  "version": "0.3.1",
+  "description": "适应多种使用场景，将注意力支配权交还给用户。移动端提供「单帧」、「聊天」和「完整」三种模式，用户可以选择彻底屏蔽执行噪声，也可随时展开完整轨迹；PC 端提供远程窗口功能，可在多台设备上以桌面端原生 UI 界面操作核心设备上的 DeepSeek Harness。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./client/client.js",
+    "./package.json": "./package.json",
+    "./b-agent-preset": "./lib/b-agent-preset.js",
+    "./b-agent-schedule": "./lib/b-agent-schedule.js"
+  },
+  "files": [
+    "lib",
+    "DISCLOSURE",
+    "client/client.js",
+    "SKILL.md",
+    "SKILL-soul.md",
+    "docs/guide",
+    "docs/DSH-Everywhere.md",
+    "scripts/soul-offline-rollback.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "check:adb": "node scripts/adb-channel-check.mjs",
+    "guard:keys": "node scripts/check-staged-keys.mjs --all",
+    "prepare": "node scripts/install-git-hooks.mjs || exit 0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0",
+    "dsh": ">=0.1.5-rc.2 <0.3.0"
+  },
+  "author": "xingzhen199186",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xingzhen199186/dsh-everywhere.git"
+  },
+  "homepage": "https://github.com/xingzhen199186/dsh-everywhere#readme",
+  "bugs": {
+    "url": "https://github.com/xingzhen199186/dsh-everywhere/issues"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh": ">=0.1.5-rc.2 <0.3.0",
+    "@deepseek-ai/schemastery": "^3.18.3"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.2.1-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.3"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "mobile",
+    "remote",
+    "minimal"
+  ],
+  "license": "MIT",
+  "disclosure": {
+    "transport": "手机与电脑之间走 http 还是 https，取决于你选哪条路：内网是明文 http；Tailscale 默认也是明文 http，可以另开一个加密的 https 地址；Cloudflare 公网隧道是 https。访问口令随 URL 传递，所以公网隧道那条路请不要在不可信网络里用。",
+    "storage": "不保存对话内容之外的任何凭据。cloudflared 与 frpc 二进制按需下载到 DSH 数据目录，不上传。",
+    "telemetry": "不收集、不上传任何数据。",
+    "network": "启用公网隧道时，流量经 Cloudflare 中转；内网和 Tailscale 两条路不经过任何第三方。"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots"
+      ]
+    }
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.74.0",
+    "qrcode": "^1.5.4",
+    "yaml": "^2.9.1"
+  },
+  "contentPolicy": {
+    "class": "dual-use"
+  }
+}
