@@ -128,7 +128,7 @@ keyPassword=……
 gradlew.bat assembleBridgeDebug -PappVersionName=0.1.0 -PappVersionCode=1
 ```
 
-2026-11-27 起 `versionCode` 重新从 1 起算。**已装过旧开发包的用户必须先卸载再安装**，否则 Android 会因为新包的版本号更低而拒绝安装。
+2026-11-27 起 `versionCode` 从 **11** 起算（不是 1）。原因：11-16 那版对外包的 `versionCode` 已经是 10，新包若写 1，系统会判定为降级而拒装。对外显示的版本名仍是 0.1.0；**已装旧包的用户可以直接覆盖安装**。
 
 ## 明文 HTTP 的边界
 

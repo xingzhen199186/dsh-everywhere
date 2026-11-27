@@ -48,9 +48,12 @@ android {
         targetSdk = 34
 
         // 两个 flavor 都继承这里的版本号；禁止给 bridge 单独设置更高的号段。
-        // 2026-11-27：新项目版本重新起算，versionName 为 0.1.0、versionCode 为 1。
+        // 2026-11-27：新项目版本重新起算，versionName 为 0.1.0。
+        // versionCode 从 11 起：2026-11-16 那版对外包的 versionCode 已经是 10，
+        // 若新构建写 1，系统会认为比已装的旧包"更低"而拒装（用户必须先卸载）。
+        // 对外显示始终是 0.1.0；内部构建号只在系统比较新旧时起作用。
         // 旧开发包号段更大，系统会拒绝降级安装；老用户需先卸载，不能覆盖更新。
-        versionCode = providers.gradleProperty("appVersionCode").orElse("1").get().toInt()
+        versionCode = providers.gradleProperty("appVersionCode").orElse("11").get().toInt()
         versionName = providers.gradleProperty("appVersionName").orElse("0.1.0").get()
 
         // 正式版的应用内更新直接读公开更新清单，不再依赖电脑上的开发产物；
